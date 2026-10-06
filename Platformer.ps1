@@ -111,45 +111,6 @@ public static class XInputPad {
 }
 catch { $PadSupport = $false }
 
-# Controller rumble. Optional: if anything goes wrong here, the game simply doesn't rumble.
-$RumbleSupport = $false
-if ($PadSupport) {
-    try {
-        if (-not ('XInputRumble' -as [type])) {
-            Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-public static class XInputRumble {
-    [StructLayout(LayoutKind.Sequential)]
-    struct VIBRATION { public ushort Left; public ushort Right; }
-
-    [DllImport("xinput1_4.dll", EntryPoint = "XInputSetState")]   static extern uint Set14(uint index, ref VIBRATION v);
-    [DllImport("xinput9_1_0.dll", EntryPoint = "XInputSetState")] static extern uint Set91(uint index, ref VIBRATION v);
-
-    static int dll = 0;
-
-    public static void Set(int index, double low, double high) {
-        VIBRATION v = new VIBRATION();
-        v.Left  = (ushort)(Math.Max(0.0, Math.Min(1.0, low))  * 65535);
-        v.Right = (ushort)(Math.Max(0.0, Math.Min(1.0, high)) * 65535);
-        if (dll == 0) {
-            try { Set14((uint)index, ref v); return; }
-            catch (Exception) { dll = 1; }
-        }
-        if (dll == 1) {
-            try { Set91((uint)index, ref v); return; }
-            catch (Exception) { dll = 2; }
-        }
-    }
-}
-'@
-        }
-        $RumbleSupport = $true
-    }
-    catch { $RumbleSupport = $false }
-}
-
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -192,19 +153,7 @@ $PhysicsSpec = [ordered]@{
     climbSpeed      = @(150, 0, 2000)     # speed on ladders and vines
     hurtBounce      = @(560, 0, 4000)     # how high a hit (enemy, spikes, hazard) throws you
     hurtKnockback   = @(260, 0, 4000)     # how hard a hit pushes you sideways, away from what hit you
-    fallGravity     = @(1.4, 0.5, 5)      # gravity multiplier while falling (fall faster than you rise = less floaty)
-    apexGravity     = @(0.6, 0.1, 1)      # gravity multiplier at the top of a held jump (a little hang time to aim)
-    apexThreshold   = @(70, 0, 1000)      # vertical speed below this counts as "the top of the jump"
-    turnAccel       = @(1.8, 1, 10)       # ground acceleration multiplier when reversing direction (no ice-skating)
-    fastFall        = @(1.35, 1, 3)       # max fall speed multiplier while holding Down in the air
-    cornerCorrection = @(6, 0, 16)        # pixels: clip a ceiling corner by this much and you slide around it
 }
-
-$script:HitStop     = 0.0     # seconds the action freezes after a big hit (makes impacts feel solid)
-$script:RumbleTimer = 0.0
-$script:FxRng       = [System.Random]::new()
-
-$NewPhysicsKeys = 'fallGravity', 'apexGravity', 'apexThreshold', 'turnAccel', 'fastFall', 'cornerCorrection'
 
 # What the hero mumbles when left alone long enough to doze off (worlds can replace these)
 $DefaultSleepTalk = @(
@@ -235,26 +184,6 @@ $ActionKeys = @{
 $GameDir   = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PSPlatformer'
 $WorldsDir = Join-Path $GameDir 'Worlds'
 New-Item -ItemType Directory -Path $WorldsDir -Force | Out-Null
-
-# ---------------------------------------------------------------------------
-# Player settings (settings.json in the game folder): comfort, assist mode and controls
-# ---------------------------------------------------------------------------
-$SettingsPath = Join-Path $GameDir 'settings.json'
-$DefaultActionKeys = @{}
-foreach ($a in @($ActionKeys.Keys)) { $DefaultActionKeys[$a] = @($ActionKeys[$a]) }
-$ActionNames = [ordered]@{
-    Left = 'Move left'; Right = 'Move right'; Jump = 'Jump / swim'; Down = 'Down (crouch, pipes)'
-    Up = 'Up (climb, doors)'; Fire = 'Action / fire / throw'; Swap = 'Swap power'; Dismount = 'Get off a mount'
-}
-$ReservedKeys = 'Escape', 'R', 'F11', 'System', 'LWin', 'RWin'
-$GameSpeeds   = 100, 90, 80, 70, 60, 50
-$script:Settings = @{
-    Shake = 'On'; HitPause = $true; Rumble = $true; Fullscreen = $false              # comfort
-    GameSpeed = 100; InfiniteLives = $false; NoDamage = $false; PitRescue = $false   # assist mode
-}
-$script:CaptureAction = $null
-$script:CaptureIndex  = 0
-$script:OverlayBack   = $null     # what Esc does in a sub-menu (go back a level instead of closing)
 
 $LoadingTips = @(
     'Tip: Hold jump to jump higher. Tap it for a short hop.',
@@ -333,76 +262,6 @@ function Format-Duration([double]$Seconds) {
     else                              { '{0}s' -f $span.Seconds }
 }
 
-function Read-Settings {
-    if (-not (Test-Path -LiteralPath $SettingsPath)) { return }
-    try { $o = Get-Content -LiteralPath $SettingsPath -Raw | ConvertFrom-Json } catch { return }
-    if ("$($o.Shake)" -in 'On', 'Reduced', 'Off') { $script:Settings.Shake = "$($o.Shake)" }
-    foreach ($n in 'HitPause', 'Rumble', 'Fullscreen', 'InfiniteLives', 'NoDamage', 'PitRescue') {
-        if ($null -ne $o.$n) { $script:Settings[$n] = [bool]$o.$n }
-    }
-    $gs = 0
-    if ([int]::TryParse("$($o.GameSpeed)", [ref]$gs) -and $GameSpeeds -contains $gs) { $script:Settings.GameSpeed = $gs }
-    foreach ($prop in @(Get-JsonProperties $o.Controls)) {
-        if (-not $ActionKeys.Contains($prop.Name)) { continue }
-        $keys = @(@($prop.Value) | ForEach-Object { "$_" } | Where-Object { $_ -and $_ -notlike 'Pad*' -and $ReservedKeys -notcontains $_ })
-        if ($keys.Count) { $ActionKeys[$prop.Name] = @($keys) + @($DefaultActionKeys[$prop.Name] | Where-Object { $_ -like 'Pad*' }) }
-    }
-}
-
-function Save-Settings {
-    $controls = [ordered]@{}
-    foreach ($a in $ActionNames.Keys) { $controls[$a] = @($ActionKeys[$a] | Where-Object { $_ -notlike 'Pad*' }) }
-    $st = $script:Settings
-    $o = [ordered]@{
-        Shake = $st.Shake; HitPause = $st.HitPause; Rumble = $st.Rumble; Fullscreen = $st.Fullscreen
-        GameSpeed = $st.GameSpeed; InfiniteLives = $st.InfiniteLives; NoDamage = $st.NoDamage; PitRescue = $st.PitRescue
-        Controls = $controls
-    }
-    try { $o | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $SettingsPath -Encoding UTF8 } catch { }
-}
-
-# Friendly names for keys ("D1" -> "1", "Return" -> "Enter", ...)
-function Get-KeyName([string]$Key) {
-    if ($Key -match '^D(\d)$') { return $Matches[1] }
-    if ($Key -match '^NumPad(\d)$') { return "Num $($Matches[1])" }
-    switch ($Key) {
-        'Return' { 'Enter' }   'Space' { 'Space' }   'Back' { 'Backspace' }
-        'LeftCtrl' { 'L-Ctrl' }   'RightCtrl' { 'R-Ctrl' }   'LeftShift' { 'L-Shift' }   'RightShift' { 'R-Shift' }
-        'LeftAlt' { 'L-Alt' }   'RightAlt' { 'R-Alt' }   'Capital' { 'Caps Lock' }
-        default { $Key }
-    }
-}
-
-# The keyboard keys for an action as short text (at most $Max keys)
-function Get-KeyList([string]$Action, [int]$Max = 3, [string]$Sep = ', ') {
-    $keys = @($ActionKeys[$Action] | Where-Object { $_ -notlike 'Pad*' } | ForEach-Object { Get-KeyName $_ })
-    if ($keys.Count -eq 0) { return 'none' }
-    $text = ($keys | Select-Object -First $Max) -join $Sep
-    if ($keys.Count -gt $Max) { $text += " +$($keys.Count - $Max)" }
-    $text
-}
-
-function Update-KeyboardHelp {
-    $script:KeyboardHelp = "Move: $(Get-KeyList 'Left' 2 '/') $(Get-KeyList 'Right' 2 '/')   Jump/Swim: $(Get-KeyList 'Jump' 2 '/')   " +
-        "Crouch/Pipe: $(Get-KeyList 'Down' 2 '/')   Climb/Door: $(Get-KeyList 'Up' 2 '/')   Action/Fire: $(Get-KeyList 'Fire' 2 '/')   " +
-        "Swap: $(Get-KeyList 'Swap' 2 '/')   Get off: $(Get-KeyList 'Dismount' 2 '/')   Pause: Esc   Restart: hold R"
-    if ($HelpText -and $script:Pad.Index -lt 0) { $HelpText.Text = $script:KeyboardHelp }
-}
-
-function Set-Fullscreen([bool]$On) {
-    if ($On) {
-        $Window.WindowState = 'Normal'          # must leave Maximized first, or the taskbar stays on top
-        $Window.WindowStyle = 'None'
-        $Window.ResizeMode  = 'NoResize'
-        $Window.WindowState = 'Maximized'
-    }
-    else {
-        $Window.WindowStyle = 'SingleBorderWindow'
-        $Window.ResizeMode  = 'CanResize'
-        $Window.WindowState = 'Normal'
-    }
-}
-
 function New-Rect([double]$X, [double]$Y, [double]$Width, [double]$Height) { [System.Windows.Rect]::new($X, $Y, $Width, $Height) }
 function New-Point([double]$X, [double]$Y) { [System.Windows.Point]::new($X, $Y) }
 
@@ -433,490 +292,6 @@ function Merge-Physics($Base, $Overrides) {
     foreach ($k in @($Base.Keys)) { $p[$k] = $Base[$k] }
     if ($Overrides) { foreach ($k in @($Overrides.Keys)) { $p[$k] = $Overrides[$k] } }
     $p
-}
-
-# ---------------------------------------------------------------------------
-# Stuck-spot checker: every level must be finishable with plain running and jumping.
-# Power-ups, mounts, ice blocks and enemies can be lost, so a level that needs one can trap the player.
-# The movement is simulated in C# (fast) with the level's real physics. Results go to the world's Warnings.
-# ---------------------------------------------------------------------------
-$script:ReachState = 'untried'     # untried / ready / unavailable
-
-function Initialize-Reach {
-    if ($script:ReachState -ne 'untried') { return ($script:ReachState -eq 'ready') }
-    $script:ReachState = 'unavailable'
-    try {
-        if (-not ('LevelReach' -as [type])) {
-            Add-Type -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-
-// One area of a level, as the checker sees it
-public class ReachMap {
-    public int W, H;
-    public double T;
-    public bool[,] Solid;     // walls and floors
-    public bool[,] Stand;     // can be stood on from above, passed from below/sides (one-way, some blocks)
-    public bool[,] Free;      // move freely: water, ladders, vines, quicksand, moving-platform paths
-    public bool[,] Kill;      // instant death: lava, deadly tiles
-    public bool[,] Good;      // goals and warps: touching one is a way out
-    public double[,] Bounce;  // springs
-}
-
-// The hero's size and physics (base movement only: no power-ups, mounts or enemies)
-public class ReachBody {
-    public double W, H, CrouchH, CrouchSpeed;
-    public double Gravity, MaxFall, Run, Jump, GroundAccel, AirAccel, GroundFriction, AirFriction;
-    public double ShortHop, FallG, ApexG, ApexT;
-    public int AirJumps;
-}
-
-public class ReachResult {
-    public bool[,] Touched;                        // every cell the hero's body can overlap
-    public int States;
-    public List<int[]> Traps = new List<int[]>();  // {col, row}: you can get here, but not to a goal, warp or even a death
-}
-
-// Explores where the hero can get by simulating real jumps, runs and falls from every spot they can stand.
-public static class LevelReach {
-    const double Dt = 1.0 / 60.0;
-
-    class Spot { public double X, Y; public bool Medium; public int Col, Row; public bool Good; public List<int> Next = new List<int>(); }
-
-    public static ReachResult Explore(ReachMap m, ReachBody b, double startX, double startY) {
-        var ex = new Explorer(m, b);
-        return ex.Run(startX, startY);
-    }
-
-    class Explorer {
-        ReachMap m; ReachBody b;
-        Dictionary<int, Spot> spots = new Dictionary<int, Spot>();
-        Queue<int> queue = new Queue<int>();
-        bool[,] touched;
-
-        public Explorer(ReachMap map, ReachBody body) { m = map; b = body; touched = new bool[m.W, m.H]; }
-
-        bool SolidAt(int tx, int ty) {
-            if (tx < 0 || tx >= m.W) return true;          // side edges are walls
-            if (ty < 0 || ty >= m.H) return false;         // open sky above, pits below
-            return m.Solid[tx, ty];
-        }
-        bool Cell(bool[,] g, int tx, int ty) { return tx >= 0 && ty >= 0 && tx < m.W && ty < m.H && g[tx, ty]; }
-
-        bool Hit(double x, double y, double w, double h) {
-            int x0 = (int)Math.Floor(x / m.T), x1 = (int)Math.Floor((x + w - 0.001) / m.T);
-            int y0 = (int)Math.Floor(y / m.T), y1 = (int)Math.Floor((y + h - 0.001) / m.T);
-            for (int ty = y0; ty <= y1; ty++) for (int tx = x0; tx <= x1; tx++) if (SolidAt(tx, ty)) return true;
-            return false;
-        }
-
-        bool Overlaps(bool[,] g, double x, double y, double w, double h, double inset) {
-            int x0 = (int)Math.Floor((x + inset) / m.T), x1 = (int)Math.Floor((x + w - inset - 0.001) / m.T);
-            int y0 = (int)Math.Floor((y + inset) / m.T), y1 = (int)Math.Floor((y + h - inset - 0.001) / m.T);
-            for (int ty = y0; ty <= y1; ty++) for (int tx = x0; tx <= x1; tx++) if (Cell(g, tx, ty)) return true;
-            return false;
-        }
-
-        void Touch(double x, double y, double w, double h) {
-            int x0 = Math.Max(0, (int)Math.Floor(x / m.T)), x1 = Math.Min(m.W - 1, (int)Math.Floor((x + w - 0.001) / m.T));
-            int y0 = Math.Max(0, (int)Math.Floor(y / m.T)), y1 = Math.Min(m.H - 1, (int)Math.Floor((y + h - 0.001) / m.T));
-            for (int ty = y0; ty <= y1; ty++) for (int tx = x0; tx <= x1; tx++) touched[tx, ty] = true;
-        }
-
-        // Same rules as Move-Entity in the game: X then Y, in small steps, one-way tiles only from above
-        double MoveX(double x, double y, double h, double dx, out bool hit) {
-            hit = false;
-            int steps = Math.Max(1, (int)Math.Ceiling(Math.Abs(dx) / (m.T * 0.45)));
-            double s = dx / steps;
-            for (int i = 0; i < steps; i++) {
-                x += s;
-                int ty0 = (int)Math.Floor(y / m.T), ty1 = (int)Math.Floor((y + h - 0.001) / m.T);
-                int tx = s > 0 ? (int)Math.Floor((x + b.W - 0.001) / m.T) : (int)Math.Floor(x / m.T);
-                for (int ty = ty0; ty <= ty1; ty++) {
-                    if (SolidAt(tx, ty)) { x = s > 0 ? tx * m.T - b.W : (tx + 1) * m.T; hit = true; return x; }
-                }
-            }
-            return x;
-        }
-
-        double MoveY(double x, double y, double h, double dy, out bool landed, out bool hitTop) {
-            landed = false; hitTop = false;
-            int steps = Math.Max(1, (int)Math.Ceiling(Math.Abs(dy) / (m.T * 0.45)));
-            double s = dy / steps;
-            for (int i = 0; i < steps; i++) {
-                double prevBottom = y + h;
-                y += s;
-                int tx0 = (int)Math.Floor(x / m.T), tx1 = (int)Math.Floor((x + b.W - 0.001) / m.T);
-                int ty = s > 0 ? (int)Math.Floor((y + h - 0.001) / m.T) : (int)Math.Floor(y / m.T);
-                if (ty < 0 || ty >= m.H) continue;
-                for (int tx = tx0; tx <= tx1; tx++) {
-                    bool block = SolidAt(tx, ty) || (s > 0 && Cell(m.Stand, tx, ty) && prevBottom <= ty * m.T + 0.5);
-                    if (!block) continue;
-                    if (s > 0) { y = ty * m.T - h; landed = true; } else { y = (ty + 1) * m.T; hitTop = true; }
-                    return y;
-                }
-            }
-            return y;
-        }
-
-        int Key(bool medium, int col, int row) { return (medium ? m.W * m.H : 0) + row * m.W + col; }
-
-        int Add(bool medium, int col, int row, double x, double y) {
-            int k = Key(medium, col, row);
-            if (!spots.ContainsKey(k)) {
-                spots[k] = new Spot { X = x, Y = y, Medium = medium, Col = col, Row = row };
-                queue.Enqueue(k);
-            }
-            return k;
-        }
-
-        void Link(int from, int to) { if (from >= 0 && from != to && !spots[from].Next.Contains(to)) spots[from].Next.Add(to); }
-
-        // Runs one movement attempt and links every spot it reaches. Returns true if it found a way out (goal, warp or death).
-        bool Sim(int from, double x, double y, double vx, double vy, bool onGround, int dir, int releaseAt, int holdFrames, bool airJump, bool fromMedium) {
-            double h = b.H;
-            bool crouched = false;
-            if (Hit(x, y, b.W, h)) {
-                if (b.CrouchH < b.H && !Hit(x, y + b.H - b.CrouchH, b.W, b.CrouchH)) { y += b.H - b.CrouchH; h = b.CrouchH; crouched = true; }
-                else return false;
-            }
-            bool walking = onGround;
-            bool wasAir = !onGround;
-            bool usedAir = false;
-            bool good = false;
-            int lastKey = -1;
-            for (int f = 0; f < 420; f++) {
-                int d = (releaseAt >= 0 && f >= releaseAt) ? 0 : dir;
-                bool held = f < holdFrames;
-                double target = d * b.Run * (crouched ? b.CrouchSpeed : 1.0);
-                double acc = onGround ? (d != 0 ? b.GroundAccel : b.GroundFriction) : (d != 0 ? b.AirAccel : b.AirFriction);
-                if (vx < target) vx = Math.Min(target, vx + acc * Dt); else if (vx > target) vx = Math.Max(target, vx - acc * Dt);
-
-                double g = b.Gravity;
-                bool nearApex = Math.Abs(vy) < b.ApexT;
-                if (vy < 0 && !held) g *= b.ShortHop;
-                else if (held && nearApex && !onGround) g *= b.ApexG;
-                else if (vy > 0) g *= b.FallG;
-                vy = Math.Min(b.MaxFall, vy + g * Dt);
-                if (airJump && !usedAir && !onGround && f > 4 && vy >= 0) { vy = -b.Jump * 0.9; usedAir = true; }
-
-                bool hitX;
-                x = MoveX(x, y, h, vx * Dt, out hitX);
-                if (hitX) vx = 0;
-                bool landed, hitTop;
-                y = MoveY(x, y, h, vy * Dt, out landed, out hitTop);
-                if (landed || hitTop) vy = 0;
-                onGround = landed;
-                if (!onGround) wasAir = true;
-
-                // Crawl through low gaps, stand up again when there's room
-                if (crouched && !Hit(x, y + h - b.H, b.W, b.H)) { y = y + h - b.H; h = b.H; crouched = false; }
-                if (!crouched && hitX && onGround && d != 0 && b.CrouchH < b.H) {
-                    double cy = y + b.H - b.CrouchH;
-                    if (!Hit(x + d * 2, cy, b.W, b.CrouchH)) { y = cy; h = b.CrouchH; crouched = true; hitX = false; vx = d * b.Run * b.CrouchSpeed; }
-                }
-
-                if (y > m.H * m.T + 64) { good = true; break; }                // fell out: a death, so not stuck
-                Touch(x, y, b.W, h);
-                if (Overlaps(m.Good, x, y, b.W, h, 0)) good = true;
-                if (Overlaps(m.Kill, x, y, b.W, h, 3)) { good = true; break; }  // lava, deadly tiles: also a death
-
-                // Water, ladders, quicksand, platform paths: hand over to the free-movement flood
-                if (!(fromMedium && f < 8)) {
-                    int mc = (int)Math.Floor((x + b.W / 2) / m.T);
-                    int mrMid = (int)Math.Floor((y + h / 2) / m.T), mrFeet = (int)Math.Floor((y + h - 2) / m.T);
-                    int mr = Cell(m.Free, mc, mrMid) ? mrMid : (Cell(m.Free, mc, mrFeet) ? mrFeet : -1);
-                    if (mr >= 0) { Link(from, Add(true, mc, mr, x, y)); break; }
-                }
-
-                if (onGround) {
-                    int bc = (int)Math.Floor((x + b.W / 2) / m.T), br = (int)Math.Floor((y + h + 1) / m.T);
-                    if (bc >= 0 && br >= 0 && bc < m.W && br < m.H && m.Bounce[bc, br] > 0) {
-                        vy = -m.Bounce[bc, br] * (held ? 1.12 : 1.0); onGround = false; wasAir = true; walking = false; continue;
-                    }
-                    int col = (int)Math.Floor((x + b.W / 2) / m.T);
-                    int row = (int)Math.Floor((y + h - 1) / m.T);
-                    if (col >= 0 && col < m.W && row >= 0 && row < m.H) {
-                        int k = Key(false, col, row);
-                        if (k != lastKey) { Link(from, Add(false, col, row, x, y + h - b.H)); lastKey = k; }
-                    }
-                    if (!walking || wasAir) break;              // a jump or fall has landed
-                    if (hitX) break;                            // walked into a wall
-                    if (d == 0 && Math.Abs(vx) < 1) break;
-                    if (f > 150) break;
-                }
-            }
-            return good;
-        }
-
-        void Expand(int k) {
-            Spot s = spots[k];
-            bool good = false;
-            if (s.Medium) {
-                if (Cell(m.Good, s.Col, s.Row)) good = true;
-                touched[s.Col, s.Row] = true;
-                int[] dx = { 1, -1, 0, 0 }, dy = { 0, 0, 1, -1 };
-                for (int i = 0; i < 4; i++) {
-                    int nc = s.Col + dx[i], nr = s.Row + dy[i];
-                    if (Cell(m.Free, nc, nr) && !SolidAt(nc, nr)) {
-                        double nx = nc * m.T + (m.T - b.W) / 2, ny = (nr + 1) * m.T - b.H;
-                        Link(k, Add(true, nc, nr, nx, ny));
-                    }
-                }
-                // Climb or swim out of it
-                double px = s.Col * m.T + (m.T - b.W) / 2, py = (s.Row + 1) * m.T - b.H;
-                if (Hit(px, py, b.W, b.H)) { py = s.Row * m.T; if (Hit(px, py, b.W, b.H)) { px = s.X; py = s.Y; } }
-                for (int dir = -1; dir <= 1; dir++) {
-                    good |= Sim(k, px, py, dir * b.Run * 0.6, -b.Jump, false, dir, -1, 999, false, true);
-                    if (dir != 0) good |= Sim(k, px, py, dir * b.Run * 0.6, 0, false, dir, -1, 0, false, true);
-                }
-            }
-            else {
-                double cx = s.X;
-                double y = s.Y;
-                if (Hit(cx, y, b.W, b.H)) {
-                    // Only room to crawl here
-                    for (int dir = -1; dir <= 1; dir += 2) good |= Sim(k, cx, y, 0, 0, true, dir, -1, 0, false, false);
-                }
-                else {
-                    for (int dir = -1; dir <= 1; dir += 2) {
-                        // Walk (and walk off ledges)
-                        good |= Sim(k, cx, y, 0, 0, true, dir, -1, 0, false, false);
-                        good |= Sim(k, cx, y, dir * b.Run, 0, true, dir, -1, 0, false, false);
-                        // Jump from the very edge of this tile with a running start, and from where we stand
-                        double edge = dir > 0 ? s.Col * m.T + m.T - 1 : s.Col * m.T + 1 - b.W;
-                        double[] starts = { cx, edge };
-                        foreach (double sx in starts) {
-                            if (Hit(sx, y, b.W, b.H)) continue;
-                            good |= Sim(k, sx, y, dir * b.Run, -b.Jump, false, dir, -1, 999, false, false);   // full jump
-                            good |= Sim(k, sx, y, dir * b.Run, -b.Jump, false, dir, -1, 6, false, false);     // short hop
-                            foreach (int rel in new int[] { 6, 14, 24, 36 })                                   // steer, then let go
-                                good |= Sim(k, sx, y, dir * b.Run, -b.Jump, false, dir, rel, 999, false, false);
-                            good |= Sim(k, sx, y, 0, -b.Jump, false, dir, -1, 999, false, false);              // standing jump, steering
-                            if (b.AirJumps > 0) good |= Sim(k, sx, y, dir * b.Run, -b.Jump, false, dir, -1, 999, true, false);
-                        }
-                    }
-                    good |= Sim(k, cx, y, 0, -b.Jump, false, 0, -1, 999, b.AirJumps > 0, false);           // straight up
-                }
-            }
-            s.Good = good;
-        }
-
-        public ReachResult Run(double startX, double startY) {
-            int startCol = (int)Math.Floor((startX + b.W / 2) / m.T), startRow = (int)Math.Floor((startY + b.H - 1) / m.T);
-            startCol = Math.Max(0, Math.Min(m.W - 1, startCol)); startRow = Math.Max(0, Math.Min(m.H - 1, startRow));
-            bool startFree = Cell(m.Free, startCol, startRow);
-            int startKey = Add(startFree, startCol, startRow, startX, startY);
-            // Let the hero settle onto the ground first (starts can be placed in the air)
-            if (!startFree) Sim(startKey, startX, startY, 0, 0, false, 0, -1, 0, false, false);
-            while (queue.Count > 0) Expand(queue.Dequeue());
-
-            // Which spots can get to a way out? Walk the links backwards from the good ones.
-            var back = new Dictionary<int, List<int>>();
-            foreach (var kv in spots) foreach (int n in kv.Value.Next) {
-                List<int> l; if (!back.TryGetValue(n, out l)) { l = new List<int>(); back[n] = l; }
-                l.Add(kv.Key);
-            }
-            var ok = new Dictionary<int, bool>();
-            var q = new Queue<int>();
-            foreach (var kv in spots) if (kv.Value.Good) { ok[kv.Key] = true; q.Enqueue(kv.Key); }
-            while (q.Count > 0) {
-                int k = q.Dequeue();
-                List<int> l; if (!back.TryGetValue(k, out l)) continue;
-                foreach (int p in l) if (!ok.ContainsKey(p)) { ok[p] = true; q.Enqueue(p); }
-            }
-
-            var res = new ReachResult { Touched = touched, States = spots.Count };
-            foreach (var kv in spots) if (!ok.ContainsKey(kv.Key) && kv.Key != startKey) res.Traps.Add(new int[] { kv.Value.Col, kv.Value.Row });
-            if (!ok.ContainsKey(startKey)) res.Traps.Insert(0, new int[] { spots[startKey].Col, spots[startKey].Row });
-            return res;
-        }
-    }
-}
-'@
-        }
-        $script:ReachState = 'ready'
-    }
-    catch { }
-    $script:ReachState -eq 'ready'
-}
-
-# The level's physics as the checker needs them (missing values use the defaults)
-function New-ReachBody($Level) {
-    $p = $Level.Physics; $pl = $Level.Chapter.Player
-    $v = { param($k) if ($p -and $null -ne $p[$k]) { [double]$p[$k] } else { [double]$PhysicsSpec[$k][0] } }
-    $b = New-Object ReachBody
-    $b.W = [double]$pl.Width; $b.H = [double]$pl.Height
-    $b.CrouchH = if ($pl.CrouchHeight) { [double]$pl.CrouchHeight } else { [double]$pl.Height }
-    $b.CrouchSpeed = & $v 'crouchSpeed'
-    $b.Gravity = & $v 'gravity'; $b.MaxFall = & $v 'maxFall'; $b.Run = & $v 'runSpeed'; $b.Jump = & $v 'jumpSpeed'
-    $b.GroundAccel = & $v 'groundAccel'; $b.AirAccel = & $v 'airAccel'
-    $b.GroundFriction = & $v 'groundFriction'; $b.AirFriction = & $v 'airFriction'
-    $b.ShortHop = & $v 'shortHopGravity'; $b.FallG = & $v 'fallGravity'; $b.ApexG = & $v 'apexGravity'; $b.ApexT = & $v 'apexThreshold'
-    $b.AirJumps = [int](& $v 'airJumps')
-    $b
-}
-
-# One area as solid / standable / free-movement / deadly / way-out cells. Unknown or changing things are
-# treated generously (locks, toggle blocks and gates count as open), so warnings are about real problems.
-function New-ReachMap($Area, $Symbols, [double]$Ts, $Level) {
-    $w = $Area.W; $h = $Area.H
-    $m = New-Object ReachMap
-    $m.W = $w; $m.H = $h; $m.T = $Ts
-    foreach ($n in 'Solid', 'Stand', 'Free', 'Kill', 'Good') { $m.$n = New-Object 'bool[,]' $w, $h }
-    $m.Bounce = New-Object 'double[,]' $w, $h
-    $liquid = New-Object 'bool[,]' $w, $h; $lava = New-Object 'bool[,]' $w, $h; $sand = New-Object 'bool[,]' $w, $h
-    $isTile = New-Object 'bool[,]' $w, $h
-    for ($y = 0; $y -lt $h; $y++) {
-        $row = $Area.Rows[$y]
-        for ($x = 0; $x -lt $w; $x++) {
-            $c = $row[$x]
-            if ($c -ceq [char]'.' -or $c -ceq [char]' ' -or $c -ceq [char]'P' -or $c -ceq [char]'C') { continue }
-            if ($c -ceq [char]'G') { $m.Good[$x, $y] = $true; continue }
-            if ($c -ge [char]'0' -and $c -le [char]'9') {
-                if (@($Level.WarpLinks["$c"]).Count -ge 2) { $m.Good[$x, $y] = $true }
-                continue
-            }
-            $sym = $null
-            if (-not $Symbols.TryGetValue($c, [ref]$sym)) { continue }
-            $t = $sym.Def
-            switch ($sym.Kind) {
-                'exit' { $m.Good[$x, $y] = $true }
-                'platform' {
-                    # A moving platform can carry you anywhere along its path
-                    $x0 = $x + [math]::Min(0, [int]$t.MoveX); $x1 = $x + [int]$t.Width - 1 + [math]::Max(0, [int]$t.MoveX)
-                    $y0 = $y - 2 + [math]::Min(0, [int]$t.MoveY); $y1 = $y + [int]$t.Height - 1 + [math]::Max(0, [int]$t.MoveY)
-                    for ($py = [math]::Max(0, $y0); $py -le [math]::Min($h - 1, $y1); $py++) {
-                        for ($px = [math]::Max(0, $x0); $px -le [math]::Min($w - 1, $x1); $px++) { $m.Free[$px, $py] = $true }
-                    }
-                }
-                'tile' {
-                    $isTile[$x, $y] = $true
-                    if ($t.IsBlock) {
-                        if ($t.Lock -or $t.Toggle -or $t.Gate) { $m.Stand[$x, $y] = $true }                      # can open: assume open
-                        elseif ($t.Breakable -and $t.Breakable.By.Contains('head')) { $m.Stand[$x, $y] = $true } # breakable without power
-                        else { $m.Solid[$x, $y] = $true }    # ? blocks, switches, crumbling floors, bricks only power-ups can break
-                        break
-                    }
-                    if ($t.Solid -and $t.SolidFor -ne 'enemies') { $m.Solid[$x, $y] = $true }
-                    if ($t.OneWay) { $m.Stand[$x, $y] = $true }
-                    if ($t.Climb) { $m.Free[$x, $y] = $true }
-                    if ($t.Liquid) { $liquid[$x, $y] = $true }
-                    if ($t.Lava) { $lava[$x, $y] = $true }
-                    if ($t.Quicksand) { $sand[$x, $y] = $true }
-                    if ($t.Bounce -gt 0) { $m.Bounce[$x, $y] = [double]$t.Bounce }
-                    if (($t.Deadly -and $t.InstantKill) -or $t.SpikeKill) { $m.Kill[$x, $y] = $true }
-                }
-            }
-        }
-    }
-    # Ladder and vine tops can be stood on; liquids fill around things placed in them (same as the game)
-    for ($y = 0; $y -lt $h; $y++) {
-        for ($x = 0; $x -lt $w; $x++) {
-            if ($m.Free[$x, $y] -and $isTile[$x, $y] -and ($y -eq 0 -or -not $m.Free[$x, ($y - 1)]) -and -not $m.Solid[$x, $y]) { $m.Stand[$x, $y] = $true }
-            if (-not $isTile[$x, $y] -and $Area.Rows[$y][$x] -cne [char]'.') {
-                foreach ($g in $liquid, $lava, $sand) {
-                    if (($y -gt 0 -and $g[$x, ($y - 1)]) -or ($x -gt 0 -and $x -lt $w - 1 -and $g[($x - 1), $y] -and $g[($x + 1), $y])) { $g[$x, $y] = $true }
-                }
-            }
-        }
-    }
-    # Rising and falling water / lava layers: water counts at its highest, lava at its lowest
-    foreach ($lq in @($Area.Liquids)) {
-        if (-not $lq) { continue }
-        $from = if ($null -ne $lq.From) { [int]$lq.From } else { 0 }
-        $to = if ($null -ne $lq.To) { [int]$lq.To } else { $w - 1 }
-        $top = if ($lq.Kind -eq 'water') { [int][math]::Floor([math]::Min($lq.High, $lq.Level)) } else { [int][math]::Ceiling([math]::Max($lq.Low, $lq.Level)) }
-        $grid = $null                     # (not 'if' as an expression: that would flatten the grid)
-        if ($lq.Kind -eq 'water') { $grid = $liquid } elseif ($lq.Kind -eq 'lava') { $grid = $lava }
-        if (-not $grid) { continue }
-        for ($y = [math]::Max(0, $top); $y -lt $h; $y++) { for ($x = [math]::Max(0, $from); $x -le [math]::Min($w - 1, $to); $x++) { $grid[$x, $y] = $true } }
-    }
-    for ($y = 0; $y -lt $h; $y++) {
-        for ($x = 0; $x -lt $w; $x++) {
-            if ($liquid[$x, $y] -or $sand[$x, $y]) { $m.Free[$x, $y] = $true }
-            if ($lava[$x, $y]) { $m.Kill[$x, $y] = $true }
-        }
-    }
-    $m
-}
-
-# Where can the hero get from one spot, following warps between areas?
-function Invoke-ReachSearch($Level, $Maps, $Body, [string]$AreaId, [int]$CellX, [int]$CellY) {
-    $ts = $Maps[$AreaId].T
-    $res = @{ Reached = $false; FarCol = -1; FarArea = $AreaId; Checkpoints = New-Object System.Collections.ArrayList; Traps = New-Object System.Collections.ArrayList }
-    $todo = New-Object System.Collections.Queue
-    $seen = [System.Collections.Generic.HashSet[string]]::new()
-    $todo.Enqueue(@{ Area = $AreaId; X = $CellX; Y = $CellY })
-    while ($todo.Count) {
-        $e = $todo.Dequeue()
-        if (-not $seen.Add("$($e.Area)|$($e.X)|$($e.Y)")) { continue }
-        $m = $Maps[$e.Area]
-        if (-not $m) { continue }
-        $r = [LevelReach]::Explore($m, $Body, $e.X * $ts + ($ts - $Body.W) / 2, ($e.Y + 1) * $ts - $Body.H)
-        foreach ($t in $r.Traps) { [void]$res.Traps.Add(@{ Area = $e.Area; Col = $t[0]; Row = $t[1] }) }
-        $area = $Level.Areas[$e.Area]
-        for ($y = 0; $y -lt $m.H; $y++) {
-            $row = $area.Rows[$y]
-            for ($x = 0; $x -lt $m.W; $x++) {
-                if (-not $r.Touched[$x, $y]) { continue }
-                if ($e.Area -eq $AreaId -and $x -gt $res.FarCol) { $res.FarCol = $x }
-                $c = $row[$x]
-                if ($c -ceq [char]'C') { [void]$res.Checkpoints.Add(@{ Area = $e.Area; X = $x; Y = $y }) }
-                elseif ($m.Good[$x, $y]) {
-                    if ($c -ge [char]'0' -and $c -le [char]'9') {
-                        foreach ($p in @(@($Level.WarpLinks["$c"]) | Select-Object -First 2)) {
-                            if (-not ($p.Area -eq $e.Area -and $p.X -eq $x -and $p.Y -eq $y)) { $todo.Enqueue(@{ Area = $p.Area; X = $p.X; Y = $p.Y }) }
-                        }
-                    }
-                    else { $res.Reached = $true }
-                }
-            }
-        }
-    }
-    $res
-}
-
-function Test-LevelReach($Level) {
-    if ($Level.Error -or -not $Level.Start -or $Level.IsMiniGame) { return }
-    if (-not (Initialize-Reach)) { return }
-    $world = $script:Loader.World
-    $ts = [double]$world.TileSize
-    $tag = "Level $($Level.Label) ($($Level.Name))"
-    $body = New-ReachBody $Level
-    $maps = @{}
-    foreach ($area in @($Level.Areas.Values)) { if ($area.Rows) { $maps[$area.Id] = New-ReachMap $area $Level.Chapter.Symbols $ts $Level } }
-    if (-not $maps[$Level.Start.Area]) { return }
-    $found = 0
-
-    $run = Invoke-ReachSearch $Level $maps $body $Level.Start.Area $Level.Start.X $Level.Start.Y
-    if (-not $run.Reached) {
-        $world.Warnings.Add("STUCK RISK - $($tag): the exit can't be reached by running and jumping alone, so a player who loses (or never finds) the power-up, mount or ice block they need is stuck. " +
-                            "On foot the hero gets no further right than column $($run.FarCol + 1) of area '$($run.FarArea)'. Add another way through: a lower step, a crawl gap, a spring or a ladder.")
-        $found++
-    }
-    else {
-        # Dying at a checkpoint sends you back there, so every checkpoint must lead to an exit too
-        $done = [System.Collections.Generic.HashSet[string]]::new()
-        foreach ($cp in $run.Checkpoints) {
-            if (-not $done.Add("$($cp.Area)|$($cp.X)|$($cp.Y)")) { continue }
-            $sub = Invoke-ReachSearch $Level $maps $body $cp.Area $cp.X $cp.Y
-            if (-not $sub.Reached) {
-                $world.Warnings.Add("STUCK RISK - $($tag): from the checkpoint at column $($cp.X + 1), line $($cp.Y + 1) of area '$($cp.Area)' the exit can't be reached by running and jumping. Players who respawn there are stuck.")
-                $found++
-            }
-        }
-        # Pits and pockets you can drop into but never leave (not even by dying)
-        $reported = New-Object System.Collections.ArrayList
-        foreach ($t in @($run.Traps | Sort-Object { $_.Area }, { $_.Col })) {
-            if (@($reported | Where-Object { $_.Area -eq $t.Area -and [math]::Abs($_.Col - $t.Col) -le 4 }).Count) { continue }
-            [void]$reported.Add($t)
-            if ($reported.Count -gt 3) { break }
-            $world.Warnings.Add("STUCK RISK - $($tag): the hero can get stuck around column $($t.Col + 1), line $($t.Row + 1) of area '$($t.Area)' - there's no way out from there (no exit, warp or even a pit). Add a way back up.")
-            $found++
-        }
-    }
-    if ($found) { $script:Loader.StuckLevels++ }
 }
 
 # ---------------------------------------------------------------------------
@@ -1080,8 +455,7 @@ function ConvertFrom-SlotJson([string]$Json) {
     foreach ($x in @($o.exits)) { if ($x) { [void]$slot.exits.Add("$x") } }
     foreach ($x in @($o.stash)) { if ($x) { [void]$slot.stash.Add("$x") } }
     if ($null -ne $o.lives) { $slot.lives = [int]$o.lives }
-    $slot.gameOver = $false
-    if ([bool]$o.gameOver) { $slot.lives = $null }       # saves locked by the old Game Over rule come back with full lives
+    $slot.gameOver = [bool]$o.gameOver
     foreach ($x in @($o.tetrominoes)) { if ($x -and -not $slot.tetrominoes.Contains("$x")) { [void]$slot.tetrominoes.Add("$x") } }
     if ($o.record) {
         foreach ($prop in @(Get-JsonProperties $o.record)) {
@@ -1387,7 +761,6 @@ function Get-ShownWorldSummaries {
                                HorizontalAlignment="Center" Margin="0,0,0,26"/>
                     <Button Name="BtnPlay"   Content="Play"                Style="{StaticResource MenuButton}"/>
                     <Button Name="BtnStats"  Content="Stats"               Style="{StaticResource MenuButton}"/>
-                    <Button Name="BtnOptions" Content="Options"            Style="{StaticResource MenuButton}"/>
                     <Button Name="BtnSample" Content="Create sample world" Style="{StaticResource MenuButton}"/>
                     <Button Name="BtnFolder" Content="Open worlds folder"  Style="{StaticResource MenuButton}"/>
                     <Button Name="BtnExit"   Content="Exit"                Style="{StaticResource MenuButton}"/>
@@ -1625,7 +998,7 @@ function Invoke-Safe([scriptblock]$Action) {
 }
 
 # Buttons is a list of @{ Text = '...'; Action = { ... } }. Works with the mouse, arrow keys + Enter, or a controller.
-function Show-Overlay([string]$Title, [string]$Text, [object[]]$Buttons, [int]$Select = 0) {
+function Show-Overlay([string]$Title, [string]$Text, [object[]]$Buttons) {
     $OverlayTitle.Text = $Title
     $OverlayText.Text  = $Text
     $OverlayButtons.Children.Clear()
@@ -1635,12 +1008,10 @@ function Show-Overlay([string]$Title, [string]$Text, [object[]]$Buttons, [int]$S
         $btn.Margin  = '6,4'
         $btn.Content = $b.Text
         $btn.Tag     = $b.Action
-        if ($b.Small) { $btn.FontSize = 14 }
         $btn.Add_Click({ param($s, $e) Invoke-Safe $s.Tag })
         [void]$OverlayButtons.Children.Add($btn)
     }
-    $script:OverlayBack = $null
-    $script:OverlayIndex = [math]::Max(0, [math]::Min($Select, @($Buttons).Count - 1))
+    $script:OverlayIndex = 0
     Update-OverlaySelection
     $Overlay.Visibility = 'Visible'
 }
@@ -1672,104 +1043,11 @@ function Invoke-OverlayKey([string]$Key) {
         return $true
     }
     if ($Key -in 'Escape', 'PadStart', 'PadB') {
-        if ($script:OverlayBack) { Invoke-Safe $script:OverlayBack; return $true }    # sub-menu: go back one level
         if ($script:Run -and $script:Run.State -eq 'Paused') { Resume-Game }
         elseif (-not $script:Run -and -not $script:Timing) { Hide-Overlay; if ($script:World) { Show-Hub } }
         return $true
     }
     $false
-}
-
-# ---- Options: comfort settings, controls and assist mode ----
-function Get-OnOff([bool]$Value) { if ($Value) { 'On' } else { 'Off' } }
-
-function Switch-Setting([string]$Name) {
-    $st = $script:Settings
-    switch ($Name) {
-        'Shake' {
-            $order = 'On', 'Reduced', 'Off'
-            $st.Shake = $order[([array]::IndexOf($order, "$($st.Shake)") + 1) % $order.Count]
-        }
-        'GameSpeed' { $st.GameSpeed = $GameSpeeds[([array]::IndexOf($GameSpeeds, [int]$st.GameSpeed) + 1) % $GameSpeeds.Count] }
-        default { $st[$Name] = -not $st[$Name] }
-    }
-    if ($Name -eq 'Fullscreen') { Set-Fullscreen $st.Fullscreen }
-    if ($Name -eq 'Rumble' -and -not $st.Rumble) { Stop-Rumble }
-    Save-Settings
-    if ($script:Run) { Update-Hud }
-}
-
-function Show-Options([int]$Select = 0) {
-    $st = $script:Settings
-    Show-Overlay 'OPTIONS' "Screen shake and hit pause make hits feel punchy. Turn them down if they bother you.`nF11 switches fullscreen any time. Changes are saved right away." @(
-        @{ Text = "Screen shake: $($st.Shake)";              Action = { Switch-Setting 'Shake';      Show-Options 0 } }
-        @{ Text = "Hit pause: $(Get-OnOff $st.HitPause)";      Action = { Switch-Setting 'HitPause';   Show-Options 1 } }
-        @{ Text = "Rumble: $(Get-OnOff $st.Rumble)";           Action = { Switch-Setting 'Rumble';     Show-Options 2 } }
-        @{ Text = "Fullscreen: $(Get-OnOff $st.Fullscreen)";   Action = { Switch-Setting 'Fullscreen'; Show-Options 3 } }
-        @{ Text = 'Controls...';                               Action = { Show-Controls } }
-        @{ Text = 'Assist mode...';                            Action = { Show-Assist } }
-        @{ Text = 'Back';                                      Action = { Close-Options } }
-    ) $Select
-    $script:OverlayBack = { Close-Options }
-}
-
-function Close-Options {
-    if ($script:Run -and $script:Run.State -eq 'Paused') { Show-PauseMenu }
-    else { Hide-Overlay }
-}
-
-function Show-Assist([int]$Select = 0) {
-    $st = $script:Settings
-    Show-Overlay 'ASSIST MODE' ("Make the game easier, any time you like. Nothing is locked or marked.`n" +
-                                "Invincibility: enemies, spikes and lava can't hurt you.  Pit rescue: fall in a pit and you're put back on solid ground.") @(
-        @{ Text = "Game speed: $($st.GameSpeed)%";                  Action = { Switch-Setting 'GameSpeed';     Show-Assist 0 } }
-        @{ Text = "Infinite lives: $(Get-OnOff $st.InfiniteLives)"; Action = { Switch-Setting 'InfiniteLives'; Show-Assist 1 } }
-        @{ Text = "Invincibility: $(Get-OnOff $st.NoDamage)";       Action = { Switch-Setting 'NoDamage';      Show-Assist 2 } }
-        @{ Text = "Pit rescue: $(Get-OnOff $st.PitRescue)";         Action = { Switch-Setting 'PitRescue';     Show-Assist 3 } }
-        @{ Text = 'Back';                                           Action = { Show-Options 5 } }
-    ) $Select
-    $script:OverlayBack = { Show-Options 5 }
-}
-
-function Show-Controls([int]$Select = 0) {
-    $buttons = @()
-    $i = 0
-    foreach ($a in $ActionNames.Keys) {
-        $buttons += @{ Text = "$($ActionNames[$a]):  $(Get-KeyList $a)"; Small = $true; Action = [scriptblock]::Create("Start-KeyCapture '$a' $i") }
-        $i++
-    }
-    $buttons += @{ Text = 'Reset to defaults'; Small = $true; Action = { Reset-Controls } }
-    $buttons += @{ Text = 'Back';              Small = $true; Action = { Show-Options 4 } }
-    Show-Overlay 'CONTROLS' "Pick an action, then press the key you want for it.`nEsc, R and F11 are reserved. Controller buttons stay the same." $buttons $Select
-    $script:OverlayBack = { Show-Options 4 }
-}
-
-function Start-KeyCapture([string]$Action, [int]$Index) {
-    Show-Overlay 'PRESS A KEY' "Press the key you want for: $($ActionNames[$Action])`n(Esc to cancel)" @()
-    $script:CaptureAction = $Action
-    $script:CaptureIndex  = $Index
-}
-
-# The next key press after Start-KeyCapture lands here
-function Complete-KeyCapture([string]$Key) {
-    $a = $script:CaptureAction
-    if ($Key -in 'Escape', 'PadStart', 'PadB') { $script:CaptureAction = $null; Show-Controls $script:CaptureIndex; return }
-    if ($Key -like 'Pad*' -or $ReservedKeys -contains $Key) {
-        $OverlayText.Text = "$(Get-KeyName $Key) can't be used here - press a keyboard key for: $($ActionNames[$a])`n(Esc to cancel)"
-        return
-    }
-    $script:CaptureAction = $null
-    $ActionKeys[$a] = @($Key) + @($DefaultActionKeys[$a] | Where-Object { $_ -like 'Pad*' })
-    Save-Settings
-    Update-KeyboardHelp
-    Show-Controls $script:CaptureIndex
-}
-
-function Reset-Controls {
-    foreach ($a in @($DefaultActionKeys.Keys)) { $ActionKeys[$a] = @($DefaultActionKeys[$a]) }
-    Save-Settings
-    Update-KeyboardHelp
-    Show-Controls $ActionNames.Count
 }
 
 function Show-Toast([string]$Text) {
@@ -1783,7 +1061,6 @@ function Show-Toast([string]$Text) {
 # ---------------------------------------------------------------------------
 # Called when a key or controller button goes down. Returns $true if the game used it.
 function Invoke-KeyDown([string]$Key) {
-    if ($script:CaptureAction) { Complete-KeyCapture $Key; return $true }
     if ($script:Blocks) { return (Invoke-BlockKey $Key) }
     $R = $script:Run
     if ($Overlay.Visibility -eq 'Visible') { return (Invoke-OverlayKey $Key) }
@@ -1792,14 +1069,8 @@ function Invoke-KeyDown([string]$Key) {
         if ($R.State -eq 'Playing') { Suspend-Game }
         return $true
     }
-    if ($R.State -ne 'Playing') {
-        if ($R.State -eq 'Dead') { [void]$script:Held.Add($Key) }
-        return $false
-    }
-    if ($Key -eq 'R' -and -not $R.MiniGame) {
-        if ($script:Held.Add('R')) { $R.RestartHold = 0.0; Show-Toast 'Keep holding R to restart the level' }
-        return $true
-    }
+    if ($R.State -ne 'Playing') { return $false }
+    if ($Key -eq 'R' -and -not $R.MiniGame) { Start-Level $R.LevelNumber $null; return $true }
     if (-not $script:Held.Add($Key)) { return $true }      # ignore keyboard auto-repeat
     $R.IdleTime = 0.0
     if ($R.Player.Sleeping) { Stop-Sleeping; return $true }  # the first press just wakes the hero up
@@ -1942,7 +1213,6 @@ function Start-WorldLoad($Summary) {
     $script:Loader.Total   = 0
     $script:Loader.Done    = 0
     $script:Loader.World   = $null
-    $script:Loader.StuckLevels = 0
     $script:Loader.Path    = $Summary.Path
     $script:Loader.Started = [DateTime]::Now
 
@@ -1980,9 +1250,6 @@ function Step-WorldLoad {
     $script:World    = $L.World
     $script:MapCache = @{}
     $script:HubNote = $script:AfterLoadNote; $script:AfterLoadNote = $null
-    if ($L.StuckLevels) {
-        $script:HubNote = "$(if ($script:HubNote) { "$($script:HubNote)  " })Heads up: $($L.StuckLevels) level(s) have spots where players could get stuck - see Warnings."
-    }
     Show-Hub
 }
 
@@ -2377,7 +1644,6 @@ function Read-WorldDefinition {
     foreach ($p in $paths) { Add-LoadStep "Loading $p" { param($arg1) Import-WorldImage $arg1 } $p }
     foreach ($lvl in $world.Levels) { Add-LoadStep "Reading level $($lvl.Label): $($lvl.Name)" { param($arg1) Import-WorldLevel $arg1 } $lvl }
     foreach ($lvl in $miniLevels) { Add-LoadStep "Reading mini-game: $($lvl.Name)" { param($arg1) Import-WorldLevel $arg1 } $lvl }
-    foreach ($lvl in $world.Levels) { Add-LoadStep "Checking level $($lvl.Label) for spots where players could get stuck" { param($arg1) Test-LevelReach $arg1 } $lvl }
     Add-LoadStep 'Reading saves' { Import-WorldSaves } $null
 }
 
@@ -2761,10 +2027,32 @@ function Read-ChapterDefinition($def, $Parent, [int]$Index, [string]$Id) {
         [void](Add-WorldSymbol $ctx $prop.Name 'throwable' $th 'Throwable')
     }
 
-    # ---- Spawners: where survival enemies appear ----
+    # ---- Spawners: where survival enemies appear, or (with "dispense") pipes that keep spitting things out ----
     foreach ($prop in @(Get-JsonProperties $def.spawners)) {
         $v = $prop.Value
-        $sp = @{ Name = Get-OrDefault $v.name 'Spawner'; Image = Resolve-AssetPath $v.image; Color = $v.color }
+        $label = "$($tag)Spawner '$($prop.Name)'"
+        $sp = @{ Name = Get-OrDefault $v.name 'Spawner'; Image = Resolve-AssetPath $v.image; Color = $v.color; Dispense = $null }
+        if ($v.dispense) {
+            $list = New-Object System.Collections.ArrayList
+            foreach ($k in @($v.dispense)) {
+                $k = "$k"; $sym = $null
+                if ($k.Length -ne 1 -or -not $ch.Symbols.TryGetValue([char]$k, [ref]$sym) -or $sym.Kind -notin 'enemy', 'item') { $warn.Add("$label dispense: '$k' isn't an enemy or item symbol."); continue }
+                if ($sym.Kind -eq 'item' -and $sym.Def.Type -in 'coin', 'key', 'collectible', 'life', 'tetromino') { $warn.Add("$label dispense: '$k' is a $($sym.Def.Type); only power-ups and enemies can come out of a pipe."); continue }
+                [void]$list.Add($k)
+            }
+            if ($list.Count) {
+                $sp.Dispense = @($list)
+                $sp.Every  = Read-Number $v.every 3 0.2 600 "$label every" $warn
+                $sp.Launch = Read-Number $v.launch 420 0 2000 "$label launch" $warn
+                $sp.Range  = Read-Number $v.range 640 32 100000 "$label range" $warn
+                $sp.Solid  = if ($null -ne $v.solid) { [bool]$v.solid } else { $true }
+                $walk = "$(Get-OrDefault $v.walk 'away')".ToLower()
+                if ($walk -notin 'left', 'right', 'player', 'away') { $warn.Add("$label walk must be left, right, player or away."); $walk = 'away' }
+                $sp.Walk = $walk
+                $sp.Max = @{}
+                foreach ($m in @(Get-JsonProperties $v.max)) { $sp.Max[$m.Name] = [int](Read-Number $m.Value 1 0 50 "$label max.$($m.Name)" $warn) }
+            }
+        }
         [void](Add-WorldSymbol $ctx $prop.Name 'spawner' $sp 'Spawner')
     }
 
@@ -4700,6 +3988,7 @@ function New-AreaRuntime([string]$AreaId) {
         Platforms   = New-Object System.Collections.ArrayList
         Liquids     = New-Object System.Collections.ArrayList
         Spawners    = New-Object System.Collections.ArrayList
+        Dispensers  = New-Object System.Collections.ArrayList
         PopSpikes   = New-Object System.Collections.ArrayList
         Throwables  = New-Object System.Collections.ArrayList
         Survival    = $null
@@ -4772,7 +4061,12 @@ function New-AreaRuntime([string]$AreaId) {
                         $spn = @{ X = $x * $ts; Y = $y * $ts; W = $ts; H = $ts; CellX = $x; CellY = $y; Sprite = $null }
                         $img = Get-WorldImage $def.Image
                         if ($img -or $def.Color) { $spn.Sprite = New-Sprite $img $ts $ts $def.Color }
-                        [void]$A.Spawners.Add($spn)
+                        if ($def.Dispense) {
+                            $spn.Def = $def; $spn.Timer = 1.0; $spn.Next = 0
+                            if ($def.Solid) { $A.Solid[$x, $y] = $true; $A.EnemySolid[$x, $y] = $true }
+                            [void]$A.Dispensers.Add($spn)
+                        }
+                        else { [void]$A.Spawners.Add($spn) }
                     }
                     'tile' {
                         if (-not $def.IsBlock) { break }
@@ -4869,7 +4163,7 @@ function Show-AreaVisuals($A) {
     $TileImage.Width  = $A.Map.WidthPx
     $TileImage.Height = $A.Map.HeightPx
     [void]$WorldCanvas.Children.Add($TileImage)
-    foreach ($list in $A.Spawners, $A.Goals, $A.Checkpoints, $A.Warps, $A.Locks, $A.Blocks, $A.Items, $A.Mounts, $A.Enemies, $A.Platforms, $A.Throwables) {
+    foreach ($list in $A.Spawners, $A.Dispensers, $A.Goals, $A.Checkpoints, $A.Warps, $A.Locks, $A.Blocks, $A.Items, $A.Mounts, $A.Enemies, $A.Platforms, $A.Throwables) {
         foreach ($ent in $list) {
             if (-not $ent.Sprite -or $ent.Dead -or $ent.Taken -or $ent.Open -or $ent.Gone) { continue }
             Add-Sprite $ent.Sprite
@@ -4994,7 +4288,6 @@ function Start-Life {
         Sleeping = $false; TalkTimer = 0.0; Bubble = $null
     }
     $R.IdleTime = 0.0
-    $R.Safe = $null; $R.LastRescue = $null
     $R.PlayerBase = Get-FirstBitmap $world.Player.Image $world.Player.Anims
     $R.Player.BaseBitmap = $R.PlayerBase
     $R.Player.Sprite = New-Sprite $R.PlayerBase $world.Player.Width $world.Player.Height '#3D7BFF'
@@ -5006,9 +4299,10 @@ function Start-Life {
     if ($R.MiniGame) { Initialize-Twist }
     $R.State = 'Playing'
     $DeathText.Visibility = 'Collapsed'
-    Set-Fade 1; $R.FadeIn = 0.3          # fade back in (Update-Playing)
+    Set-Fade 0
     Clear-Presses
-    Sync-PadHeld                          # keys you're still holding keep working: no need to re-press after respawning
+    $script:Held.Clear()
+    Sync-PadHeld
     Update-Camera 1.0
     Update-Sprites 0
     Update-Hud
@@ -5063,7 +4357,6 @@ function Use-Key([string]$LockId, [string]$Id) {
 
 function Start-Warp($Warp) {
     $R = $script:Run
-    $R.FadeIn = 0.0
     if ($Warp.LockId) {
         if (-not (Use-Key $Warp.LockId "warp|$($Warp.Digit)")) {
             Show-Toast "Locked. You need the $($Warp.LockId) key."
@@ -5115,8 +4408,6 @@ function Start-GameLoop {
 }
 
 function Stop-GameLoop {
-    Stop-Rumble
-    $script:HitStop = 0.0
     if ($script:LoopOn) {
         [System.Windows.Media.CompositionTarget]::remove_Rendering($script:RenderHandler)
         $script:LoopOn = $false
@@ -5133,7 +4424,6 @@ function Update-Game {
     if ($dt -le 0) { return }
     if ($dt -gt 0.034) { $dt = 0.034 }
     try {
-        if ($script:RumbleTimer -gt 0) { $script:RumbleTimer -= $dt; if ($script:RumbleTimer -le 0) { Stop-Rumble } }
         Update-Pad
         $R = $script:Run
         if (-not $R) { return }
@@ -5141,13 +4431,6 @@ function Update-Game {
             $script:ToastTimer -= $dt
             if ($script:ToastTimer -le 0) { $ToastBox.Visibility = 'Collapsed' }
         }
-        if ($R.State -eq 'Playing' -and $script:HitStop -gt 0) {
-            # Hit-stop: a few frozen frames on a big hit. Presses made now are kept for when it ends.
-            $script:HitStop -= $dt
-            Update-Camera 0
-            return
-        }
-        $dt *= [double]$script:Settings.GameSpeed / 100.0            # assist: game speed
         switch ($R.State) {
             'Playing' { Update-Playing $dt }
             'Dead'    { Update-Dead $dt }
@@ -5251,33 +4534,6 @@ function Move-Entity($Ent, [double]$DX, [double]$DY, $Ignore = $null) {
             }
         }
     }
-}
-
-# A big moment: shake the screen, freeze the action for a few frames, buzz the controller
-function Add-Impact([double]$Shake, [double]$Stop, [double]$Rumble = 0) {
-    $R = $script:Run
-    $Shake *= switch ($script:Settings.Shake) { 'Off' { 0.0 } 'Reduced' { 0.4 } default { 1.0 } }
-    if (-not $script:Settings.HitPause) { $Stop = 0.0 }
-    if ($R) { $R.Shake = [math]::Max([double]$R.Shake, $Shake) }
-    $script:HitStop = [math]::Max($script:HitStop, $Stop)
-    if ($Rumble -gt 0) { Start-Rumble $Rumble ([math]::Max(0.12, $Rumble * 0.3)) }
-}
-
-function Start-Rumble([double]$Strength, [double]$Seconds) {
-    if (-not $RumbleSupport -or -not $script:Settings.Rumble -or $script:Pad.Index -lt 0) { return }
-    try { [XInputRumble]::Set($script:Pad.Index, $Strength, $Strength * 0.6); $script:RumbleTimer = $Seconds } catch { }
-}
-
-function Stop-Rumble {
-    $script:RumbleTimer = 0.0
-    if (-not $RumbleSupport -or $script:Pad.Index -lt 0) { return }
-    try { [XInputRumble]::Set($script:Pad.Index, 0, 0) } catch { }
-}
-
-# Enemy damage uses a slightly smaller box than the sprite, so brushing an edge doesn't hurt you
-function Test-FairHit($A, $B) {
-    $in = [math]::Min(4.0, $A.W * 0.15)
-    ($A.X + $in -lt $B.X + $B.W) -and ($A.X + $A.W - $in -gt $B.X) -and ($A.Y + $in -lt $B.Y + $B.H) -and ($A.Y + $A.H -gt $B.Y)
 }
 
 function Test-Overlap($A, $B) {
@@ -5536,14 +4792,6 @@ function Update-Playing([double]$dt) {
     if (-not ($A.Survival -and $A.Survival.State -eq 'active') -and -not $pl.Sleeping) { $R.LifeTime += $dt }    # the clock stops during a survival fight (and naps)
     Update-PlayerTimers $dt
 
-    # ---- Hold R to restart (a single tap does nothing, so it can't wipe your run by accident) ----
-    if (-not $R.MiniGame -and $script:Held.Contains('R')) {
-        $R.RestartHold += $dt
-        if ($R.RestartHold -ge 1.0) { [void]$script:Held.Remove('R'); Start-Level $R.LevelNumber $null; return }
-    }
-    else { $R.RestartHold = 0.0 }
-    if ($R.FadeIn -gt 0) { $R.FadeIn -= $dt; Set-Fade ([math]::Max(0.0, $R.FadeIn / 0.3)) }
-
     # ---- Time limit: 0 = no limit ----
     if ($R.TimeLimit -gt 0 -and $R.LifeTime -ge $R.TimeLimit) {
         if ($R.MiniGame) { Complete-MiniGameLevel "Time's up!"; return }
@@ -5559,7 +4807,6 @@ function Update-Playing([double]$dt) {
     if ($R.State -ne 'Playing') { return }
     Update-Twist $dt
     $ph = $R.Phys
-    foreach ($k in $NewPhysicsKeys) { if ($null -eq $ph[$k]) { $ph[$k] = [double]$PhysicsSpec[$k][0] } }   # older saved settings may lack the new keys
 
     $left     = Test-Held 'Left'
     $right    = Test-Held 'Right'
@@ -5641,7 +4888,6 @@ function Update-Playing([double]$dt) {
     $grounded = $pl.OnGround -and -not $inWater
     if ($target -ne 0) { $accel = if ($grounded) { $ph.groundAccel } else { $ph.airAccel } }
     else               { $accel = if ($grounded) { $ph.groundFriction } else { $ph.airFriction } }
-    if ($grounded -and $target -ne 0 -and $pl.VX -ne 0 -and [math]::Sign($pl.VX) -ne [math]::Sign($target)) { $accel *= $ph.turnAccel }
     if ($grounded -and $gd) { $accel *= $gd.Friction }                   # ice is slippery, mud is grippy
     if ($pl.KnockTimer -gt 0) { $pl.KnockTimer -= $dt }                  # being thrown: can't steer yet
     elseif ($pl.Climbing) { $pl.VX = [math]::Sign($target) * $ph.climbSpeed * 0.7 }
@@ -5675,7 +4921,6 @@ function Update-Playing([double]$dt) {
     }
 
     $vyBefore = $pl.VY
-    $normalMove = $false
     if ($pl.Climbing) {
         $grav = 0.0; $maxFall = 100000.0
         $pl.VY = $(if ($up -and -not $down) { -$ph.climbSpeed } elseif ($down -and -not $up) { $ph.climbSpeed } else { 0.0 })
@@ -5713,34 +4958,15 @@ function Update-Playing([double]$dt) {
                 $pl.VY = -$ph.jumpSpeed * 0.9; $pl.Buffer = 0; $pl.AirJumpsUsed++
             }
         }
-        $normalMove = $true
         $grav = $ph.gravity
-        $nearApex = [math]::Abs($pl.VY) -lt $ph.apexThreshold
         if ($ab -and $ab.Fly -and $jumpHeld -and -not $pl.OnGround) {
             $pl.VY = [math]::Max(-$ab.Fly.MaxRise, $pl.VY - $ab.Fly.Thrust * $dt)
         }
-        elseif ($pl.VY -lt 0 -and -not $jumpHeld -and -not $pl.Launched) { $grav *= $ph.shortHopGravity }   # let go early: short hop
-        elseif ($jumpHeld -and $nearApex -and -not $pl.OnGround) { $grav *= $ph.apexGravity }               # brief hang at the top
-        elseif ($pl.VY -gt 0) { $grav *= $ph.fallGravity }                                                  # fall faster than you rise
-        if ($down -and -not $pl.OnGround) { $maxFall *= $ph.fastFall }                                      # hold Down to drop faster
+        elseif ($pl.VY -lt 0 -and -not $jumpHeld -and -not $pl.Launched) { $grav *= $ph.shortHopGravity }
         if ($ab -and $ab.Glide -gt 0 -and $jumpHeld -and $pl.VY -gt 0) { $maxFall = [math]::Min($maxFall, $ab.Glide) }
     }
     $pl.VY = [math]::Min($maxFall, $pl.VY + $grav * $dt)
     if ($pl.VY -ge 0) { $pl.Launched = $false }
-
-    # Corner correction: clip a ceiling corner by a few pixels and you slide around it instead of bonking
-    if ($normalMove -and $pl.VY -lt 0 -and $ph.cornerCorrection -gt 0) {
-        $nextY = $pl.Y + $pl.VY * $dt
-        if (Test-RectSolid $pl.X $nextY $pl.W $pl.H) {
-            for ($n = 1; $n -le $ph.cornerCorrection; $n++) {
-                $shift = 0
-                foreach ($sx in @($n, -$n)) {
-                    if (-not (Test-RectSolid ($pl.X + $sx) $nextY $pl.W $pl.H) -and -not (Test-RectSolid ($pl.X + $sx) $pl.Y $pl.W $pl.H)) { $shift = $sx; break }
-                }
-                if ($shift -ne 0) { $pl.X += $shift; break }
-            }
-        }
-    }
 
     $pl.DropThrough = $pl.Climbing -or $pl.DropTimer -gt 0
     $wasOnGround = $pl.OnGround
@@ -5749,11 +4975,6 @@ function Update-Playing([double]$dt) {
     if ($pl.HitX) { $pl.VX = 0 }
     if ($pl.OnGround -or $pl.HitTop) { $pl.VY = 0 }
     if ($pl.Climbing -and $pl.OnGround -and $down) { $pl.Climbing = $false }
-    if ($script:Settings.PitRescue -and $pl.OnGround -and -not $pl.GroundSolid -and -not $inWater -and -not $inSand -and
-        (Test-RectSolid $pl.X ($pl.Y + $pl.H + 1) 2 2) -and (Test-RectSolid ($pl.X + $pl.W - 2) ($pl.Y + $pl.H + 1) 2 2)) {
-        if (-not $R.Safe) { $R.Safe = @{} }
-        $R.Safe.Area = $R.AreaId; $R.Safe.X = $pl.X; $R.Safe.Bottom = $pl.Y + $pl.H     # both feet on solid ground
-    }
 
     # ---- Hitting blocks: with your head from below, or by landing hard with a heavy-stomp power ----
     if ($hitHead) {
@@ -5765,7 +4986,6 @@ function Update-Playing([double]$dt) {
         if ($best) { [void](Invoke-BlockHit $best $(if ($ab -and $ab.BreakBlocks) { 'powerHead' } else { 'head' })) }
     }
     if ($pl.OnGround -and -not $wasOnGround -and $ab -and $ab.HeavyStomp -and $vyBefore -gt 250) {
-        Add-Impact 4 0.05 0.5
         foreach ($hx in @(($pl.X + 3), ($pl.X + $pl.W - 3))) {
             $b = Get-BlockAtPoint $hx ($pl.Y + $pl.H + 2)
             if ($b) { [void](Invoke-BlockHit $b 'heavyStomp') }
@@ -5804,13 +5024,6 @@ function Update-Playing([double]$dt) {
     $cx = $pl.X + $pl.W / 2
     if ($pl.Y -gt $R.HeightPx + 64) {
         if ($R.MiniGame) { Complete-MiniGameLevel 'You fell!' $true; return }
-        if ($script:Settings.PitRescue -and $R.Safe -and $R.Safe.Area -eq $R.AreaId -and ($null -eq $R.LastRescue -or $R.Time - $R.LastRescue -gt 2.5)) {
-            $pl.X = $R.Safe.X; $pl.Y = $R.Safe.Bottom - $pl.H; $pl.VX = 0.0; $pl.VY = 0.0
-            $R.InvulnTimer = [math]::Max($R.InvulnTimer, 1.0); $R.LastRescue = $R.Time
-            Update-Camera 1.0
-            Show-Toast 'Pit rescue!'
-            return
-        }
         Invoke-PlayerDeath 'YOU FELL!' $false; return
     }
     if (-not $pl.LavaSwim -and (Test-PointLava $cx ($pl.Y + $pl.H - 6))) {
@@ -5845,7 +5058,6 @@ function Update-Playing([double]$dt) {
         $stunned = $en.StunTimer -gt 0
         $prevBottom = $pl.Y + $pl.H - $pl.VY * $dt
         $fromAbove = -not $inWater -and -not $pl.Climbing -and $pl.VY -ge 0 -and $prevBottom -le $en.Y + 10
-        if (-not $fromAbove -and -not (Test-FairHit $pl $en)) { continue }   # only grazed it: no damage
         if ($stunned -and -not $fromAbove) { continue }          # a stunned enemy is harmless to touch
         if ($en.Def.Kickable) {
             # Shells: stomp or touch a still one to kick it, stomp a moving one to stop it
@@ -5884,9 +5096,20 @@ function Update-Playing([double]$dt) {
     Update-Blocks $dt
 
     # ---- Items ----
+    Update-Dispensers $dt
     foreach ($it in @($A.Items)) {
         if ($it.Taken) { continue }
-        if ($it.Def.Type -ne 'coin') {
+        if ($it.Falling) {
+            # Popped out of a pipe: arcs up, falls and settles on the ground
+            $it.VY = [math]::Min($R.Phys.maxFall, $it.VY + $R.Phys.gravity * $dt)
+            Move-Entity $it ($it.VX * $dt) ($it.VY * $dt)
+            if ($it.HitX) { $it.VX = 0.0 }
+            if ($it.HitTop -and $it.VY -lt 0) { $it.VY = 0.0 }
+            if ($it.Y -gt $R.HeightPx + 64 -or (Test-PointLava ($it.X + $it.W / 2) ($it.Y + $it.H - 2))) { $it.Taken = $true; Remove-Sprite $it.Sprite; continue }
+            if ($it.OnGround) { $it.Falling = $false; $it.VX = 0.0; $it.VY = 0.0; $it.BaseY = $it.Y - 3; $it.Clock = 0.0 }
+            Set-SpritePosition $it
+        }
+        elseif ($it.Def.Type -ne 'coin') {
             $it.Clock += $dt
             $it.Y = $it.BaseY + [math]::Sin($it.Clock * 3) * 3
             Set-SpritePosition $it
@@ -5950,8 +5173,7 @@ function Update-Playing([double]$dt) {
     Update-Camera $dt
     Update-Weather $dt
     Update-Sprites $dt
-    $R.HudTimer -= $dt
-    if ($R.HudTimer -le 0) { Update-Hud; $R.HudTimer = 0.1 }
+    Update-Hud
 }
 
 # ---- Easter egg: leave the hero alone long enough and he dozes off, mumbling about ravioli ----
@@ -6043,7 +5265,6 @@ function Invoke-StompBounce($En, [bool]$JumpHeld) {
     $pl.Y = [math]::Min($pl.Y, $En.Y - $pl.H)
     $pl.VY = if ($JumpHeld) { -$R.Phys.jumpSpeed * 0.85 } else { -$R.Phys.stompBounce }
     $pl.OnGround = $false
-    Add-Impact 1.5 0.035 0.25
 }
 
 function Update-PlayerTimers([double]$dt) {
@@ -6554,10 +5775,10 @@ function Invoke-EnemyDefeat($En) {
     $R.DefeatedBy[$def.Key] = [int]$R.DefeatedBy[$def.Key] + 1
     Add-Record 'enemies'
     if ($def.Boss -and -not ($def.OnDefeat -and $def.OnDefeat.Becomes)) { Add-Record 'bosses' $def.Name }
-    Invoke-TetrominoChance $En
+    if (-not $En.Dispenser) { Invoke-TetrominoChance $En }
     $fell = $En.Y -gt $R.HeightPx
     $k = 0
-    foreach ($c in @($def.Carries) + @($(if ($def.OnDefeat) { $def.OnDefeat.Drop }))) {
+    foreach ($c in $(if ($En.Dispenser) { @() } else { @($def.Carries) + @($(if ($def.OnDefeat) { $def.OnDefeat.Drop })) })) {
         if (-not $c) { continue }
         $item = Get-SymbolDef "$c" 'item'
         if (-not $item) { continue }
@@ -6574,7 +5795,7 @@ function Invoke-EnemyDefeat($En) {
 # Drops an item and/or turns the enemy into another kind (a knight losing its armour, a turtle into a shell...)
 function Invoke-EnemyChange($En, $Change) {
     $R = $script:Run
-    if ($Change.Drop) {
+    if ($Change.Drop -and -not $En.Dispenser) {          # things from a pipe never drop loot (no farming)
         $item = Get-SymbolDef "$($Change.Drop)" 'item'
         if ($item) { Add-ItemNow (New-ItemRuntime $item "drop|$($En.Origin)|$($En.Def.Key)|hit$($En.Health)" ($En.X + $En.W / 2) ($En.Y - 6)) }
     }
@@ -6828,6 +6049,74 @@ function Complete-Survival {
     if ($def.CompleteLevel) { Complete-Level $def.Exit }
 }
 
+# ---------------------------------------------------------------------------
+# Dispensers: spawners with "dispense" keep spitting out enemies and power-ups (one kind at a time, in turn)
+# while the player is near, but only while fewer than "max" of that kind are out. Stops soft locks
+# (an enemy you needed fell in the lava, you lost the power-up a puzzle needs).
+# ---------------------------------------------------------------------------
+function Get-DispensedCount($D, [string]$Key) {
+    $R = $script:Run; $n = 0
+    foreach ($en in @($R.A.Enemies) + @($R.NewEnemies)) {
+        if ($en -and -not $en.Dead -and [object]::ReferenceEquals($en.Dispenser, $D) -and "$($en.Def.Key)" -eq $Key) { $n++ }
+    }
+    foreach ($it in $R.A.Items) {
+        if (-not $it.Taken -and [object]::ReferenceEquals($it.Dispenser, $D) -and "$($it.Def.Key)" -eq $Key) { $n++ }
+    }
+    $n
+}
+
+function Get-DispenseMax($D, [string]$Key) {
+    if ($D.Def.Max.ContainsKey($Key)) { return $D.Def.Max[$Key] }
+    if (Get-SymbolDef $Key 'enemy') { 3 } else { 1 }
+}
+
+function Update-Dispensers([double]$dt) {
+    $R = $script:Run; $pl = $R.Player
+    foreach ($d in $R.A.Dispensers) {
+        $cx = $d.X + $d.W / 2
+        if ([math]::Abs($cx - ($pl.X + $pl.W / 2)) -gt $d.Def.Range) { continue }
+        $d.Timer -= $dt
+        if ($d.Timer -gt 0) { continue }
+        $d.Timer = $d.Def.Every
+        $list = $d.Def.Dispense; $n = $list.Count
+        for ($i = 0; $i -lt $n; $i++) {
+            $k = $list[($d.Next + $i) % $n]
+            if ((Get-DispensedCount $d $k) -lt (Get-DispenseMax $d $k)) {
+                Invoke-Dispense $d $k
+                $d.Next = ($d.Next + $i + 1) % $n
+                break
+            }
+        }
+    }
+}
+
+function Invoke-Dispense($D, [string]$Key) {
+    $R = $script:Run; $pl = $R.Player
+    $script:DispenseSerial = [int]$script:DispenseSerial + 1
+    $id = "dispense|$($script:DispenseSerial)"
+    $cx = $D.X + $D.W / 2
+    $toPlayer = if (($pl.X + $pl.W / 2) -lt $cx) { -1 } else { 1 }
+    $dir = switch ($D.Def.Walk) { 'left' { -1 } 'right' { 1 } 'player' { $toPlayer } default { -$toPlayer } }
+    $edef = Get-SymbolDef $Key 'enemy'
+    if ($edef) {
+        $en = New-EnemyRuntime $edef $cx $D.Y $id
+        $en.Active = $true; $en.Dispenser = $D; $en.Dir = $dir
+        $en.VY = -$D.Def.Launch; $en.LeapVX = 150.0         # hops clear of the pipe, then walks once it lands
+        [void]$R.NewEnemies.Add($en)
+        Add-Sprite $en.Sprite
+        Set-SpritePosition $en
+        return
+    }
+    $idef = Get-SymbolDef $Key 'item'
+    if ($idef) {
+        $it = New-ItemRuntime $idef $id $cx ($D.Y - 14)
+        $it.Dispenser = $D; $it.Falling = $true
+        $it.VX = $dir * 130.0; $it.VY = -$D.Def.Launch * 0.85
+        $it.OnGround = $false; $it.HitX = $false; $it.HitTop = $false; $it.GroundSolid = $null
+        Add-ItemNow $it
+    }
+}
+
 function New-SurvivalEnemy([string]$Key) {
     $R = $script:Run; $A = $R.A; $ts = $R.T
     $def = Get-SymbolDef $Key 'enemy'
@@ -6958,6 +6247,7 @@ function Set-Power([string]$Key) {
     $R.PowerKey = if ($def) { $def.Key } else { $null }
     $R.PowerTimer = if ($def -and $def.Duration) { [double]$def.Duration } else { 0.0 }
     $R.PowerHits = if ($def) { $def.Ability.Hits } else { 0 }
+    $R.PipePower = $false
     Update-Physics
 }
 
@@ -6990,7 +6280,7 @@ function Invoke-PowerSwap {
     if ($R.Stash.Count -eq 0) { Show-Toast 'Your bag has no power-ups to swap to.'; return }
     $next = "$($R.Stash[0])"
     $R.Stash.RemoveAt(0)
-    if ($R.PowerKey) { [void]$R.Stash.Add("$($R.PowerKey)") }
+    if ($R.PowerKey -and -not $R.PipePower) { [void]$R.Stash.Add("$($R.PowerKey)") }      # a pipe's power-up is just dropped
     Set-Power $next
     Show-Toast "Now wearing: $($R.Power.Name)"
 }
@@ -7025,6 +6315,20 @@ function Grant-Power($Def) {
     Show-Toast "Inventory full - swapped your $old for the $($Def.Name)"
 }
 
+# A power-up from a pipe: you always wear it straight away (what you wore goes in the bag if there's room).
+# It never goes into the bag itself, and swapping it out throws it away, so a pipe can't be used to farm power-ups.
+function Grant-PipePower($Def) {
+    $R = $script:Run
+    $note = ''
+    if ($R.PowerKey -and -not $R.PipePower) {
+        if ((Get-InventoryCount) -lt $InventorySize) { [void]$R.Stash.Add("$($R.PowerKey)"); $note = " (your $($R.Power.Name) went into your bag)" }
+        else { $note = " (bag full - your $($R.Power.Name) is gone)" }
+    }
+    Set-Power $Def.Key
+    $R.PipePower = $true
+    Show-Toast "$($Def.Name)!$note $(Get-PowerHint $Def)"
+}
+
 function Invoke-Collect($Item) {
     $R = $script:Run
     $def = $Item.Def
@@ -7032,6 +6336,7 @@ function Invoke-Collect($Item) {
         if ($R.FullToast -le 0) { Show-Toast "Inventory full ($InventorySize). Use something up first."; $R.FullToast = 2.5 }
         return
     }
+    if ($Item.Dispenser -and $R.PowerKey -and "$($R.PowerKey)" -eq "$($def.Key)") { return }   # already wearing it: leave it there
     $Item.Taken = $true
     Remove-Sprite $Item.Sprite
     if ($def.Type -eq 'tetromino') { Add-Tetromino $def.Shape; return }
@@ -7056,7 +6361,10 @@ function Invoke-Collect($Item) {
         }
         'invincible'  { [void]$R.Pending.Add(@{ Id = $Item.Id; Kind = 'item'; Sym = $def.Key }); Add-Record 'powers' $def.Name; $R.InvincibleTimer = $def.Duration; Show-Toast "$($def.Name)! You're invincible!" }
         'speed'       { [void]$R.Pending.Add(@{ Id = $Item.Id; Kind = 'item'; Sym = $def.Key }); $R.SpeedTimer = $def.Duration; $R.SpeedMult = $def.Multiplier; Show-Toast "$($def.Name)! Speed up!" }
-        default       { [void]$R.Pending.Add(@{ Id = $Item.Id; Kind = 'item'; Sym = $def.Key }); Add-Record 'powers' $def.Name; Grant-Power $def }
+        default       {
+            if ($Item.Dispenser) { Grant-PipePower $def; return }          # free refills aren't recorded or stored
+            [void]$R.Pending.Add(@{ Id = $Item.Id; Kind = 'item'; Sym = $def.Key }); Add-Record 'powers' $def.Name; Grant-Power $def
+        }
     }
 }
 
@@ -7176,20 +6484,16 @@ function Invoke-Dismount([bool]$Lost) {
 function Invoke-PlayerHurt([bool]$Bounce, [double]$FromX = [double]::NaN) {
     $R = $script:Run; $pl = $R.Player
     if ($R.InvulnTimer -gt 0 -or $R.InvincibleTimer -gt 0) { return $false }
-    if ($script:Settings.NoDamage) { $R.InvulnTimer = 0.6 }       # assist: still knocked back, but nothing is lost
-    else {
-        if ($R.Mount)     { Invoke-Dismount $true }
-        elseif ($R.Power) {
-            $down = Get-SymbolDef "$($R.Power.Ability.DowngradeTo)" 'item'
-            if ($R.PowerHits -gt 1) { $R.PowerHits--; Show-Toast "Hit! The $($R.Power.Name) can take $($R.PowerHits) more." }
-            elseif ($down -and $down.IsPower) { $old = $R.Power.Name; Add-Record 'powersLost' $old; Set-Power $down.Key; Show-Toast "Hit! $old -> $($down.Name)" }
-            else { Add-Record 'powersLost' $R.Power.Name; Show-Toast "Hit! Lost the $($R.Power.Name) - back to normal."; Set-Power $null }
-        }
-        else { Invoke-PlayerDeath 'OUCH!' $true; return $true }
-        $R.InvulnTimer = 1.5
-        Add-Impact 6 0.08 0.6
-        Invoke-DropCarried
+    if ($R.Mount)     { Invoke-Dismount $true }
+    elseif ($R.Power) {
+        $down = Get-SymbolDef "$($R.Power.Ability.DowngradeTo)" 'item'
+        if ($R.PowerHits -gt 1) { $R.PowerHits--; Show-Toast "Hit! The $($R.Power.Name) can take $($R.PowerHits) more." }
+        elseif ($down -and $down.IsPower) { $old = $R.Power.Name; Add-Record 'powersLost' $old; Set-Power $down.Key; Show-Toast "Hit! $old -> $($down.Name)" }
+        else { Add-Record 'powersLost' $R.Power.Name; Show-Toast "Hit! Lost the $($R.Power.Name) - back to normal."; Set-Power $null }
     }
+    else { Invoke-PlayerDeath 'OUCH!' $true; return $true }
+    $R.InvulnTimer = 1.5
+    Invoke-DropCarried
     if ($Bounce) {
         $vx = [double]::NaN; $lock = 0
         if (-not [double]::IsNaN($FromX)) {
@@ -7205,30 +6509,19 @@ function Invoke-PlayerHurt([bool]$Bounce, [double]$FromX = [double]::NaN) {
 function Invoke-PlayerDeath([string]$Message, [bool]$Hop) {
     $R = $script:Run
     if ($R.State -ne 'Playing') { return }
-    if ($script:Settings.NoDamage -and $Message -in 'BURNED!', 'SPIKED!', 'OUCH!') {
-        # Assist invincibility: thrown clear instead of dying (pits, crushers and time-outs still count)
-        $R.InvulnTimer = 0.6
-        Invoke-Knockback ([double]::NaN) $(if ($Message -eq 'BURNED!') { -$R.Phys.lavaBounce } else { -$R.Phys.hurtBounce }) 0
-        return
-    }
     if ($R.MiniGame) { Complete-MiniGameLevel $Message $true; return }
     $R.State = 'Dead'
     Add-Record 'deaths'
     Add-Record 'deathsBy' $Message
-    if ($script:World.Lives -gt 0 -and -not $script:Settings.InfiniteLives) {
+    if ($script:World.Lives -gt 0) {
         $slot = $R.Slot
         $slot.lives = (Get-SlotLives $slot) - 1
-        if ($slot.lives -le 0) {
-            # Out of lives: this level starts over and the lives refill. The save itself is never locked.
-            $slot.lives = $script:World.Lives; $slot.resume = $null; $R.GameOver = $true
-            Add-Record 'gameOvers'
-        }
+        if ($slot.lives -le 0) { $slot.lives = 0; $slot.gameOver = $true; $slot.resume = $null; $R.GameOver = $true }
         [void](Save-WorldData)
         $script:LastTick = $script:Clock.Elapsed.TotalSeconds
     }
     $R.DeadTimer = 1.1
     $R.DeathHop = $Hop
-    Add-Impact 0 0 0.9
     $R.Stats.deaths++
     $R.PowerKey = $null          # power-ups are lost when you die
     $pl = $R.Player
@@ -7243,9 +6536,9 @@ function Show-GameOver {
     $R = $script:Run
     $R.State = 'GameOver'
     Stop-GameLoop
-    Show-Overlay 'GAME OVER' "You ran out of lives, so this level starts over from the beginning.`nYour lives are back to $($script:World.Lives) and everything else in your save is safe.`n(Tip: Assist mode in Options has infinite lives.)" @(
-        @{ Text = 'Try again';  Action = { Hide-Overlay; Start-Level $script:Run.LevelNumber $null } }
-        @{ Text = 'World menu'; Action = { Exit-Level } }
+    Show-Overlay 'GAME OVER' "You're out of lives.`nThis save can now only be reviewed - start a new game in another slot (or delete this one)." @(
+        @{ Text = 'Review this save'; Action = { Exit-Level; Show-Review } }
+        @{ Text = 'World menu';       Action = { Exit-Level } }
     )
 }
 
@@ -7257,7 +6550,6 @@ function Update-Dead([double]$dt) {
         $pl.Y  += $pl.VY * $dt
         Set-SpritePosition $pl
     }
-    if ($R.DeadTimer -lt 0.3) { Set-Fade ([math]::Min(1.0, 1.0 - [math]::Max(0.0, $R.DeadTimer) / 0.3)) }   # fade to black
     if ($R.DeadTimer -le 0) {
         if ($R.GameOver) { Show-GameOver } else { Start-Life }
     }
@@ -7388,17 +6680,10 @@ function Suspend-Game {
     if (-not $R -or $R.State -ne 'Playing') { return }
     $R.State = 'Paused'
     $script:Held.Clear()
-    Stop-Rumble
-    Show-PauseMenu
-}
-
-function Show-PauseMenu {
-    $R = $script:Run
     if ($R.MiniGame) {
         Show-Overlay 'PAUSED' "Mini-game: $($R.MiniGame.Name)`nGiving up ends the game and you keep half the coins you've grabbed." @(
             @{ Text = 'Resume';  Action = { Resume-Game } }
             @{ Text = 'Give up'; Action = { $script:Run.State = 'Playing'; Hide-Overlay; Complete-MiniGameLevel 'You gave up.' $true } }
-            @{ Text = 'Options'; Action = { Show-Options } }
         )
         return
     }
@@ -7408,7 +6693,6 @@ function Show-PauseMenu {
     )
     if ($R.Checkpoint) { $buttons += @{ Text = 'Restart from checkpoint'; Action = { Hide-Overlay; Start-Life } } }
     $buttons += @{ Text = 'Restart level';       Action = { Hide-Overlay; Start-Level $script:Run.LevelNumber $null } }
-    $buttons += @{ Text = 'Options';             Action = { Show-Options } }
     $buttons += @{ Text = 'Save and quit';       Action = { Save-AndQuit } }
     $buttons += @{ Text = 'Quit without saving'; Action = { Exit-Level } }
     Show-Overlay 'PAUSED' "$($script:World.Name)`nLevel $($R.Level.Label): $($R.Level.Name)`n'Save and quit' lets you continue from $where." $buttons
@@ -7442,41 +6726,15 @@ function Exit-Level {
 # ---------------------------------------------------------------------------
 function Update-Camera([double]$dt) {
     $R = $script:Run; $pl = $R.Player
-    $snap = $dt -ge 1.0                                   # new life / new area: jump straight there
-    $standY = $pl.Y + $pl.H / 2 - $ViewH * 0.55
-
-    # Look-ahead eases across when you turn, instead of the whole screen swinging on every tap
-    $look = $pl.Facing * 48
-    if ($snap) { $R.LookX = $look } else { $R.LookX = [double]$R.LookX + ($look - [double]$R.LookX) * [math]::Min(1.0, $dt * 2.5) }
-    $targetX = $pl.X + $pl.W / 2 - $ViewW / 2 + $R.LookX
-
-    # Vertical: settle at the height you're standing on, and stay put during normal jumps.
-    # In the air the camera only moves when you get near the top or bottom of the screen.
-    if ($snap -or $pl.OnGround -or $pl.Climbing -or $pl.InWater) { $R.CamGoalY = $standY }
-    else {
-        $top    = $pl.Y - $ViewH * 0.22
-        $bottom = $pl.Y + $pl.H - $ViewH * 0.72
-        if ([double]$R.CamGoalY -gt $top)    { $R.CamGoalY = $top }
-        if ([double]$R.CamGoalY -lt $bottom) { $R.CamGoalY = $bottom }
-    }
-    $kx = [math]::Min(1.0, $dt * 6)
-    $ky = [math]::Min(1.0, $dt * $(if ($pl.VY -gt 400) { 10 } else { 5 }))   # catch up faster on long falls
-    if ($snap) { $kx = 1.0; $ky = 1.0 }
-    $R.CamX += ($targetX - $R.CamX) * $kx
-    $R.CamY += ([double]$R.CamGoalY - $R.CamY) * $ky
+    $targetX = $pl.X + $pl.W / 2 - $ViewW / 2 + $pl.Facing * 48
+    $targetY = $pl.Y + $pl.H / 2 - $ViewH * 0.55
+    $k = [math]::Min(1.0, $dt * 6)
+    $R.CamX += ($targetX - $R.CamX) * $k
+    $R.CamY += ($targetY - $R.CamY) * $k
     $R.CamX = [math]::Max(0.0, [math]::Min($R.CamX, $R.WidthPx - $ViewW))
     $R.CamY = [math]::Max(0.0, [math]::Min($R.CamY, $R.HeightPx - $ViewH))
-
-    # Screen shake (from Add-Impact) fades out quickly
-    $shx = 0.0; $shy = 0.0
-    if ([double]$R.Shake -gt 0.2) {
-        $shx = ($script:FxRng.NextDouble() * 2 - 1) * $R.Shake
-        $shy = ($script:FxRng.NextDouble() * 2 - 1) * $R.Shake
-        $R.Shake = [math]::Max(0.0, $R.Shake - $R.Shake * [math]::Min(1.0, $dt * 12) - 10 * $dt)
-    }
-    else { $R.Shake = 0.0 }
-    $CamTransform.X = -[math]::Round($R.CamX + $shx)
-    $CamTransform.Y = -[math]::Round($R.CamY + $shy)
+    $CamTransform.X = -[math]::Round($R.CamX)
+    $CamTransform.Y = -[math]::Round($R.CamY)
     if ($R.BgBrush) {
         $off = -(($R.CamX * 0.35) % $R.BgWidth)       # the background scrolls slower (parallax)
         $R.BgBrush.Viewport = [System.Windows.Rect]::new($off, 0, $R.BgWidth, $ViewH)
@@ -7555,100 +6813,48 @@ function Update-Sprites([double]$dt) {
     foreach ($ps2 in $A.PopSpikes) { Set-PopSpikeLook $ps2 }
 }
 
-# HUD symbols (all from Segoe UI Symbol, which every Windows has)
-$HudIcon = @{
-    Coin = [string][char]0x25CF; Clock = [string][char]0x25F7; Heart = [string][char]0x2665; Skull = [string][char]0x2620
-    Star = [string][char]0x2605; Spark = [string][char]0x2726; Shield = [string][char]0x271A; Mount = [string][char]0x265E
-    Speed = [string][char]0x00BB; Key = [string][char]0x26BF; Bag = [string][char]0x25A3; Gem = [string][char]0x25C6
-    Twist = [string][char]0x21BB; Blocks = [string][char]0x25A6; Hourglass = [string][char]0x231B; Flag = [string][char]0x2691
-}
-$HudColor = @{
-    Gold = ConvertTo-Brush '#FFC83D'; Red = ConvertTo-Brush '#FF6B6B'; Soft = ConvertTo-Brush '#C9CCE8'
-    Blue = ConvertTo-Brush '#9FE6FF'; Green = ConvertTo-Brush '#7CFF8A'; Purple = ConvertTo-Brush '#D59CFF'
-}
-$script:KeyBrushes = @{}
-
-# Key colours come from the lock id when it's a colour name ("red", "gold", "#33CC88"...)
-function Get-KeyBrush([string]$Id) {
-    if (-not $script:KeyBrushes.ContainsKey($Id)) {
-        $b = $HudColor.Blue
-        try { $b = (New-Object System.Windows.Media.BrushConverter).ConvertFromString($Id) } catch { }
-        $script:KeyBrushes[$Id] = $b
-    }
-    $script:KeyBrushes[$Id]
-}
-
-# Fills a HUD line with coloured icon + text pairs. Items are @(icon, brush, text). Rebuilt only when it changes.
-function Set-HudRuns($Box, $Items) {
-    $sig = (@($Items | ForEach-Object { "$($_[0])|$($_[2])|$($_[1])" })) -join '~'
-    if ($Box.Tag -eq $sig) { return }
-    $Box.Tag = $sig
-    $Box.Inlines.Clear()
-    $first = $true
-    foreach ($it in $Items) {
-        if (-not $first) { $Box.Inlines.Add([System.Windows.Documents.Run]::new('      ')) }
-        $first = $false
-        $icon = [System.Windows.Documents.Run]::new("$($it[0]) ")
-        $icon.Foreground = $it[1]
-        $Box.Inlines.Add($icon)
-        $Box.Inlines.Add([System.Windows.Documents.Run]::new("$($it[2])"))
-    }
-    $Box.Visibility = if ($Items.Count) { 'Visible' } else { 'Collapsed' }
-}
-
 function Update-Hud {
     $R = $script:Run
-    $I = $HudIcon; $C = $HudColor
     $coins = $R.Slot.coins
     $here = 0
     foreach ($p in $R.Pending) { if ($p.Kind -eq 'coin') { $coins += $p.Value; $here += $p.Value } }
+    $clock = if ($R.TimeLimit -gt 0) { "Time left $([math]::Max(0, [math]::Ceiling($R.TimeLimit - $R.LifeTime)))" } else { "Time $(Format-Time $R.Time)" }
+    $livesLeft = Get-SlotLives $R.Slot
+    $HudRight.Text = if ($R.MiniGame) { "Coins won $here     $clock" }
+                     else { "Coins $coins     $clock     " + $(if ($null -ne $livesLeft) { "Lives $livesLeft     " } else { '' }) + "Deaths $($R.Stats.deaths)" }
 
-    # Top right: coins, clock, lives, deaths
-    $right = New-Object System.Collections.Generic.List[object]
-    $right.Add(@($I.Coin, $C.Gold, $(if ($R.MiniGame) { "$here won" } else { "$coins" })))
-    if ($R.TimeLimit -gt 0) {
-        $left = [math]::Max(0, [math]::Ceiling($R.TimeLimit - $R.LifeTime))
-        $right.Add(@($I.Clock, $(if ($left -le 10) { $C.Red } else { $C.Soft }), "$($left)s left"))
-    }
-    else { $right.Add(@($I.Clock, $C.Soft, (Format-Time $R.Time))) }
-    if (-not $R.MiniGame) {
-        $livesLeft = Get-SlotLives $R.Slot
-        if ($null -ne $livesLeft) { $right.Add(@($I.Heart, $C.Red, $(if ($script:Settings.InfiniteLives) { [string][char]0x221E } else { "x$livesLeft" }))) }
-        $right.Add(@($I.Skull, $C.Soft, "$($R.Stats.deaths)"))
-    }
-    Set-HudRuns $HudRight $right
-
-    # Second line: your state, then whatever matters right now
-    $parts = New-Object System.Collections.Generic.List[object]
-    if ($R.Power) {
-        $parts.Add(@($I.Star, $C.Gold, ($R.Power.Name + $(if ($R.PowerHits -gt 1) { " x$($R.PowerHits)" } else { '' }) +
-                                         $(if ($R.PowerTimer -gt 0) { "  $([math]::Ceiling($R.PowerTimer))s" } else { '' }))))
-    }
-    else { $parts.Add(@($I.Heart, $C.Red, 'Normal')) }
-    if ($script:Settings.NoDamage) { $parts.Add(@($I.Shield, $C.Blue, 'Invincible (assist)')) }
-    if ($R.InvincibleTimer -gt 0) { $parts.Add(@($I.Spark, $C.Gold, "Invincible $([math]::Ceiling($R.InvincibleTimer))s")) }
-    if ($R.Mount) { $parts.Add(@($I.Mount, $C.Green, "$($R.Mount.Def.Name)")) }
-    if ($R.SpeedTimer -gt 0) { $parts.Add(@($I.Speed, $C.Blue, "Speed $([math]::Ceiling($R.SpeedTimer))s")) }
+    $parts = New-Object System.Collections.Generic.List[string]
+    $health = if ($R.Power) {
+        "Health: Powered ($($R.Power.Name)" + $(if ($R.PowerHits -gt 1) { " x$($R.PowerHits)" } else { '' }) + $(if ($R.PowerTimer -gt 0) { " $([math]::Ceiling($R.PowerTimer))s" } else { '' }) + ')'
+    } else { 'Health: Normal' }
+    if ($R.InvincibleTimer -gt 0) { $health += "  +  Invincible $([math]::Ceiling($R.InvincibleTimer))s" }
+    $parts.Add($health)
+    if ($R.Mount) { $parts.Add("Riding: $($R.Mount.Def.Name)") }
+    if ($R.SpeedTimer -gt 0) { $parts.Add("Speed $([math]::Ceiling($R.SpeedTimer))s") }
     foreach ($k in @($R.Inv.Keys)) {
         $n = [int]$R.Inv[$k]
-        if ($n -gt 0) { $parts.Add(@($I.Key, (Get-KeyBrush "$k"), ("$k key" + $(if ($n -gt 1) { " x$n" } else { '' })))) }
+        if ($n -gt 0) { $parts.Add("$k key" + $(if ($n -gt 1) { " x$n" } else { '' })) }
     }
-    if ($R.Stash.Count) { $parts.Add(@($I.Bag, $C.Soft, "$(Get-InventoryCount)/$InventorySize")) }
-    if ($R.Level.Collectibles -and -not $R.MiniGame) { $parts.Add(@($I.Gem, $C.Purple, "$($R.CollectiblesFound)/$($R.Level.Collectibles)")) }
-    if ($R.Twist) { $parts.Add(@($I.Twist, $C.Purple, "Twist: $($R.Twist.Name)")) }
+    if ($R.Stash.Count) { $parts.Add("Bag $(Get-InventoryCount)/$InventorySize") }
+    if ($R.Level.Collectibles -and -not $R.MiniGame) { $parts.Add("Found $($R.CollectiblesFound)/$($R.Level.Collectibles)") }
+    if ($R.Twist) { $parts.Add("Twist: $($R.Twist.Name)") }
     $tet = Get-TetroCollection $R.Slot
-    if ($tet.Count -gt 0 -and -not $R.MiniGame) { $parts.Add(@($I.Blocks, $C.Soft, "$($tet.Count)/$($TetroNames.Count)")) }
+    if ($tet.Count -gt 0 -and -not $R.MiniGame) { $parts.Add("Tetrominoes $($tet.Count)/$($TetroNames.Count)") }
     $S = if ($R.A) { $R.A.Survival } else { $null }
-    if ($S -and $S.State -eq 'active') { $parts.Add(@($I.Hourglass, $C.Red, "SURVIVE $([math]::Ceiling($S.Timer))s")) }
+    if ($S -and $S.State -eq 'active') { $parts.Add("SURVIVE $([math]::Ceiling($S.Timer))s") }
     foreach ($en in $R.A.Enemies) {
-        if ($en.Def.Boss -and -not $en.Dead -and $en.Active) { $parts.Add(@($I.Skull, $C.Red, "$($en.Def.Name) $([string][char]0x2665 * [math]::Max(0, $en.Health))")); break }
+        if ($en.Def.Boss -and -not $en.Dead -and $en.Active) { $parts.Add("$($en.Def.Name) $([string][char]0x2665 * [math]::Max(0, $en.Health))"); break }
     }
     $req = Get-ExitRequirement 'G'
     if ($req -and -not $R.MiniGame) {
         $gap = Get-RequirementGap $req
-        if ($gap) { $parts.Add(@($I.Flag, $C.Soft, "Exit: $gap")) } else { $parts.Add(@($I.Flag, $C.Green, 'Exit open!')) }
+        $parts.Add($(if ($gap) { "Exit: $gap" } else { 'Exit open!' }))
     }
-    Set-HudRuns $HudPower $parts
+    $text = $parts -join '      '
+    if ($HudPower.Text -ne $text) {
+        $HudPower.Text = $text
+        $HudPower.Visibility = 'Visible'
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -8952,6 +8158,20 @@ function New-SampleWorld {
     "@": {
       "name": "Slime hole",
       "image": "objects/spawner.png"
+    },
+    "/": {
+      "name": "Slime pipe",
+      "image": "tiles/pipe-top.png",
+      "dispense": [
+        "s",
+        "i"
+      ],
+      "max": {
+        "s": 3,
+        "i": 1
+      },
+      "every": 3,
+      "walk": "right"
     }
   },
   "minigames": [
@@ -9389,7 +8609,7 @@ dddddddddddddddddd......ddddddddddddddddd......ddddddddddddddddddddddddddddd....
 ....................................xx....................................................e.................................
 ....................................xx......................................................................................
 .......................ooooooo......xx....................................a.....oooooooo....................................
-..P.....i.................s............*.......C...............................................y................y.......G...
+..P.....i............/....s.........xx.*.......C...............................................y................y.......G...
 xxxxxxxxxxxxxxx....xxxxxxxxxxxxxxxxxxxxxx....xxxxxxxxxxxxxxxxxxxxxxxxxx.......xxxxxxxxxxxxxxxxxxxxxxx....xxxxxxxxxxxxxxxxxxx
 xxxxxxxxxxxxxxx....xxxxxxxxxxxxxxxxxxxxxx....xxxxxxxxxxxxxxxxxxxxxxxxxx.......xxxxxxxxxxxxxxxxxxxxxxx....xxxxxxxxxxxxxxxxxxx
 xxxxxxxxxxxxxxx....xxxxxxxxxxxxxxxxxxxxxx....xxxxxxxxxxxxxxxxxxxxxxxxxx.......xxxxxxxxxxxxxxxxxxxxxxx....xxxxxxxxxxxxxxxxxxx
@@ -9890,7 +9110,6 @@ dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 # Wire up events
 # ---------------------------------------------------------------------------
 $BtnPlay.Add_Click({ Invoke-Safe { Show-WorldSelect } })
-$BtnOptions.Add_Click({ Invoke-Safe { Show-Options } })
 $BtnStats.Add_Click({ Invoke-Safe { Show-StatsScreen } })
 $BtnSample.Add_Click({ Invoke-Safe { New-SampleWorld } })
 $BtnFolder.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$WorldsDir`"" })
@@ -9965,7 +9184,6 @@ $Window.Add_PreviewKeyDown({
     param($s, $e)
     $key = $e.Key.ToString()
     if ($key -eq 'System') { return }
-    if ($key -eq 'F11' -and -not $script:CaptureAction) { Invoke-Safe { Switch-Setting 'Fullscreen' }; $e.Handled = $true; return }
     if (Invoke-Safe { Invoke-KeyDown $key }) { $e.Handled = $true }
 })
 $Window.Add_PreviewKeyUp({ param($s, $e) [void]$script:Held.Remove($e.Key.ToString()) })
@@ -9987,9 +9205,6 @@ $Window.Add_Closing({
 # ---------------------------------------------------------------------------
 # Go
 # ---------------------------------------------------------------------------
-Read-Settings
-Update-KeyboardHelp
-if ($script:Settings.Fullscreen) { Set-Fullscreen $true }
 $HelpText.Text = $KeyboardHelp
 Show-Screen 'MainMenu'
 [void]$Window.ShowDialog()
