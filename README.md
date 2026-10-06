@@ -1,4 +1,4 @@
-<img width="738" height="438" alt="image" src="https://github.com/user-attachments/assets/136dceff-4cad-40ee-b90a-761a35826bbc" /># psplatformer
+ psplatformer
 
 The world needs a great platformer. A shining beacon of tight controls, gorgeous art, and level design so clever it makes grown adults weep.
 
@@ -17,6 +17,9 @@ A frame rate best described as "contemplative."
 Jumping. That's the whole mechanic. We worked very hard on it.
 Zero game engine. Why use Unity or Godot when you could suffer instead?
 Enterprise-grade execution policy errors before you even get to play. Some say this is the real first level.
+
+<img width="728" height="441" alt="image" src="https://github.com/user-attachments/assets/e18d8947-53d1-4af4-ac4c-daadf2ec236a" />
+
 
 <img width="738" height="438" alt="image" src="https://github.com/user-attachments/assets/264440e9-e0f6-464b-9b73-5e0e6f358f1a" />
 
